@@ -9,6 +9,8 @@ import os
 import base64
 from typing import Optional
 
+import getpass
+
 import websockets
 import sounddevice as sd
 import numpy as np
@@ -19,7 +21,7 @@ load_dotenv()
 
 def get_api_key() -> str:
     try:
-        key = keyring.get_password("ara-agent", "xai-api-key")
+        key = keyring.get_password("xai-api-key", getpass.getuser())
         if key:
             return key
     except Exception:
@@ -28,14 +30,18 @@ def get_api_key() -> str:
     if key:
         return key
     raise ValueError(
-        "No API key found. Store it with:\n"
-        "security add-generic-password -a \"$USER\" -s \"xai-api-key\" -w \"your-key\""
+        "No API key found. Either:\n"
+        "  1. Store in macOS Keychain:\n"
+        "     security add-generic-password -a \"$USER\" -s \"xai-api-key\" -w \"your-key\"\n"
+        "  2. Or set XAI_API_KEY in your .env file"
     )
 
 
 XAI_API_KEY = get_api_key()
 VOICE = "ara"
-ENDPOINT = "wss://api.x.ai/v1/realtime"
+MODEL = "grok-voice-latest"
+ENDPOINT = f"wss://api.x.ai/v1/realtime?model={MODEL}"
+SAMPLE_RATE = 24000
 
 TOOLS = [
     {
@@ -77,6 +83,9 @@ class AraAgent:
     def __init__(self):
         self.ws = None
         self.is_running = False
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.mic_queue: Optional[asyncio.Queue] = None
+        self.playback_queue: Optional[asyncio.Queue] = None
 
     async def connect(self):
         headers = {"Authorization": f"Bearer {XAI_API_KEY}"}
@@ -101,25 +110,42 @@ class AraAgent:
 
         print("✅ Connected to Ara (xAI Voice Agent)")
 
-    async def send_audio(self, audio_data: np.ndarray):
-        if self.ws:
-            audio_bytes = audio_data.tobytes()
-            b64_audio = base64.b64encode(audio_bytes).decode()
+    async def mic_sender(self):
+        """Pull mic chunks off the thread-safe queue and forward to the WS."""
+        assert self.mic_queue is not None
+        while self.is_running:
+            chunk = await self.mic_queue.get()
+            if chunk is None:
+                return
+            b64_audio = base64.b64encode(chunk.tobytes()).decode()
             await self.ws.send(json.dumps({
                 "type": "input_audio_buffer.append",
                 "audio": b64_audio
             }))
+
+    async def player(self):
+        """Play queued response audio without blocking the event loop."""
+        assert self.playback_queue is not None
+        loop = asyncio.get_running_loop()
+        while self.is_running:
+            audio = await self.playback_queue.get()
+            if audio is None:
+                return
+            # sd.play is non-blocking, sd.wait blocks — run wait in a thread
+            sd.play(audio, samplerate=SAMPLE_RATE)
+            await loop.run_in_executor(None, sd.wait)
 
     async def handle_messages(self):
         async for message in self.ws:
             data = json.loads(message)
 
             if data["type"] == "response.output_audio.delta":
-                audio_b64 = data["delta"]
-                audio_bytes = base64.b64decode(audio_b64)
-                audio = np.frombuffer(audio_bytes, dtype=np.int16)
-                sd.play(audio, samplerate=24000)
-                sd.wait()
+                # xAI/OpenAI realtime variants — accept either field name
+                audio_b64 = data.get("delta") or data.get("audio")
+                if audio_b64:
+                    audio_bytes = base64.b64decode(audio_b64)
+                    audio = np.frombuffer(audio_bytes, dtype=np.int16)
+                    await self.playback_queue.put(audio)
 
             elif data["type"] == "response.function_call_arguments.done":
                 tool_name = data["name"]
@@ -176,15 +202,37 @@ class AraAgent:
             print("  - Try storing the key again with the security command")
             return
 
+        self.loop = asyncio.get_running_loop()
+        self.mic_queue = asyncio.Queue(maxsize=100)
+        self.playback_queue = asyncio.Queue()
+        self.is_running = True
+
         def audio_callback(indata, frames, time, status):
+            # Runs in sounddevice's CFFI thread — no asyncio loop here.
             if status:
                 print(status)
-            asyncio.create_task(self.send_audio(indata[:, 0]))
+            try:
+                self.loop.call_soon_threadsafe(
+                    self.mic_queue.put_nowait, indata[:, 0].copy()
+                )
+            except asyncio.QueueFull:
+                pass  # drop chunk under backpressure
 
-        with sd.InputStream(samplerate=16000, channels=1, dtype=np.int16, callback=audio_callback):
+        with sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype=np.int16,
+            callback=audio_callback,
+        ):
             print("🎤 Listening... (Ctrl+C to stop)")
-            self.is_running = True
-            await self.handle_messages()
+            try:
+                await asyncio.gather(
+                    self.handle_messages(),
+                    self.mic_sender(),
+                    self.player(),
+                )
+            finally:
+                self.is_running = False
 
 
 async def main():
