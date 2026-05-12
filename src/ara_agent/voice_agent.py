@@ -13,14 +13,34 @@ import websockets
 import sounddevice as sd
 import numpy as np
 from dotenv import load_dotenv
+import keyring
 
 load_dotenv()
 
-XAI_API_KEY = os.getenv("XAI_API_KEY")
-if not XAI_API_KEY:
-    raise ValueError("XAI_API_KEY not found in environment")
+def get_api_key() -> str:
+    """Load API key from macOS Keychain first, then fall back to .env"""
+    try:
+        key = keyring.get_password("ara-agent", "xai-api-key")
+        if key:
+            return key
+    except Exception:
+        pass
+    
+    # Fallback to environment variable
+    key = os.getenv("XAI_API_KEY")
+    if key:
+        return key
+    
+    raise ValueError(
+        "No API key found. Either:\n"
+        "1. Store it in macOS Keychain:\n"
+        "   security add-generic-password -a \"$USER\" -s \"xai-api-key\" -w \"your-key\"\n"
+        "2. Or put it in .env file as XAI_API_KEY=your-key"
+    )
 
-VOICE = "ara"  # Warm, friendly, conversational
+
+XAI_API_KEY = get_api_key()
+VOICE = "ara"
 MODEL = "grok-voice-latest"
 ENDPOINT = "wss://api.x.ai/v1/realtime"
 
@@ -68,18 +88,15 @@ TOOLS = [
 class AraAgent:
     def __init__(self):
         self.ws: Optional[websockets.WebSocketClientProtocol] = None
-        self.audio_queue = asyncio.Queue()
         self.is_running = False
 
     async def connect(self):
-        """Connect to xAI Voice Agent API"""
         headers = {"Authorization": f"Bearer {XAI_API_KEY}"}
         self.ws = await websockets.connect(
             f"{ENDPOINT}?model={MODEL}",
             additional_headers=headers
         )
 
-        # Initialize session
         await self.ws.send(json.dumps({
             "type": "session.update",
             "session": {
@@ -98,9 +115,7 @@ class AraAgent:
         print("✅ Connected to Ara (xAI Voice Agent)")
 
     async def send_audio(self, audio_data: np.ndarray):
-        """Send audio chunk to the API"""
         if self.ws:
-            # Convert to base64 (assuming 16kHz mono int16)
             audio_bytes = audio_data.tobytes()
             b64_audio = base64.b64encode(audio_bytes).decode()
             await self.ws.send(json.dumps({
@@ -109,12 +124,10 @@ class AraAgent:
             }))
 
     async def handle_messages(self):
-        """Handle incoming messages from the API"""
         async for message in self.ws:
             data = json.loads(message)
 
             if data["type"] == "response.output_audio.delta":
-                # Play audio chunk
                 audio_b64 = data["delta"]
                 audio_bytes = base64.b64decode(audio_b64)
                 audio = np.frombuffer(audio_bytes, dtype=np.int16)
@@ -122,16 +135,13 @@ class AraAgent:
                 sd.wait()
 
             elif data["type"] == "response.function_call_arguments.done":
-                # Tool call received
                 tool_name = data["name"]
                 args = json.loads(data["arguments"])
                 print(f"\n\U0001f527 Tool call: {tool_name}({args})")
 
-                # Execute tool (basic for MVP)
                 result = await self.execute_tool(tool_name, args)
-                print(f"   Result: {result[:100]}...")
+                print(f"   Result: {result[:150]}...")
 
-                # Send result back
                 await self.ws.send(json.dumps({
                     "type": "conversation.item.create",
                     "item": {
@@ -145,7 +155,6 @@ class AraAgent:
                 print("\n\U0001f5e3️  Ara finished speaking")
 
     async def execute_tool(self, name: str, args: dict) -> str:
-        """Execute tools (MVP implementation)"""
         if name == "run_bash":
             import subprocess
             try:
@@ -163,7 +172,7 @@ class AraAgent:
         elif name == "read_file":
             try:
                 with open(args["path"], "r") as f:
-                    return f.read()[:2000]  # Limit output for MVP
+                    return f.read()[:2000]
             except Exception as e:
                 return f"Error: {str(e)}"
 
@@ -178,14 +187,12 @@ class AraAgent:
         return "Unknown tool"
 
     async def run(self):
-        """Main loop"""
         await self.connect()
 
-        # Start audio input (microphone)
         def audio_callback(indata, frames, time, status):
             if status:
                 print(status)
-            asyncio.create_task(self.send_audio(indata[:, 0]))  # Mono
+            asyncio.create_task(self.send_audio(indata[:, 0]))
 
         with sd.InputStream(
             samplerate=16000,
