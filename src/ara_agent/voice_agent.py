@@ -18,33 +18,25 @@ import keyring
 load_dotenv()
 
 def get_api_key() -> str:
-    """Load API key from macOS Keychain first, then fall back to .env"""
     try:
         key = keyring.get_password("ara-agent", "xai-api-key")
         if key:
             return key
     except Exception:
         pass
-    
-    # Fallback to environment variable
     key = os.getenv("XAI_API_KEY")
     if key:
         return key
-    
     raise ValueError(
-        "No API key found. Either:\n"
-        "1. Store it in macOS Keychain:\n"
-        "   security add-generic-password -a \"$USER\" -s \"xai-api-key\" -w \"your-key\"\n"
-        "2. Or put it in .env file as XAI_API_KEY=your-key"
+        "No API key found. Store it with:\n"
+        "security add-generic-password -a \"$USER\" -s \"xai-api-key\" -w \"your-key\""
     )
 
 
 XAI_API_KEY = get_api_key()
 VOICE = "ara"
-MODEL = "grok-voice-latest"
 ENDPOINT = "wss://api.x.ai/v1/realtime"
 
-# Basic tools for MVP
 TOOLS = [
     {
         "type": "function",
@@ -53,8 +45,8 @@ TOOLS = [
         "parameters": {
             "type": "object",
             "properties": {
-                "command": {"type": "string", "description": "The bash command to run"},
-                "reason": {"type": "string", "description": "Why you're running this command"}
+                "command": {"type": "string"},
+                "reason": {"type": "string"}
             },
             "required": ["command"]
         }
@@ -65,9 +57,7 @@ TOOLS = [
         "description": "Read the contents of a file.",
         "parameters": {
             "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path to the file"}
-            },
+            "properties": {"path": {"type": "string"}},
             "required": ["path"]
         }
     },
@@ -77,9 +67,7 @@ TOOLS = [
         "description": "List files and directories.",
         "parameters": {
             "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Directory path (default: .)"}
-            }
+            "properties": {"path": {"type": "string"}}
         }
     }
 ]
@@ -87,15 +75,14 @@ TOOLS = [
 
 class AraAgent:
     def __init__(self):
-        self.ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.ws = None
         self.is_running = False
 
     async def connect(self):
         headers = {"Authorization": f"Bearer {XAI_API_KEY}"}
-        self.ws = await websockets.connect(
-            f"{ENDPOINT}?model={MODEL}",
-            additional_headers=headers
-        )
+        
+        # Connect without specifying model (let xAI use default for Voice)
+        self.ws = await websockets.connect(ENDPOINT, additional_headers=headers)
 
         await self.ws.send(json.dumps({
             "type": "session.update",
@@ -158,13 +145,7 @@ class AraAgent:
         if name == "run_bash":
             import subprocess
             try:
-                result = subprocess.run(
-                    args["command"],
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
+                result = subprocess.run(args["command"], shell=True, capture_output=True, text=True, timeout=30)
                 return f"stdout: {result.stdout}\nstderr: {result.stderr}\nexit: {result.returncode}"
             except Exception as e:
                 return f"Error: {str(e)}"
@@ -183,23 +164,24 @@ class AraAgent:
                 return "\n".join(os.listdir(path))
             except Exception as e:
                 return f"Error: {str(e)}"
-
         return "Unknown tool"
 
     async def run(self):
-        await self.connect()
+        try:
+            await self.connect()
+        except Exception as e:
+            print(f"\n\u274c Connection failed: {e}")
+            print("Common fixes:")
+            print("  - Make sure your API key has Voice access in console.x.ai")
+            print("  - Try storing the key again with the security command")
+            return
 
         def audio_callback(indata, frames, time, status):
             if status:
                 print(status)
             asyncio.create_task(self.send_audio(indata[:, 0]))
 
-        with sd.InputStream(
-            samplerate=16000,
-            channels=1,
-            dtype=np.int16,
-            callback=audio_callback
-        ):
+        with sd.InputStream(samplerate=16000, channels=1, dtype=np.int16, callback=audio_callback):
             print("🎤 Listening... (Ctrl+C to stop)")
             self.is_running = True
             await self.handle_messages()
