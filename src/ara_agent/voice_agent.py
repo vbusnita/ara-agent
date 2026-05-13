@@ -45,6 +45,19 @@ MODEL = "grok-voice-latest"
 ENDPOINT = f"wss://api.x.ai/v1/realtime?model={MODEL}"
 SAMPLE_RATE = 24000
 
+# Jitter-buffer pre-roll: don't start playing until ~180ms of audio has
+# accumulated. Absorbs WS arrival jitter and BT delivery variance — the
+# difference between "smooth" and "occasional micro-cuts" on Bluetooth.
+# Cost is ~180ms of added latency at the start of each response, which
+# is well below perceptible for conversational pacing.
+PREROLL_MS = 180
+PREROLL_SAMPLES = SAMPLE_RATE * PREROLL_MS // 1000
+
+# Hard cap on the playback ring buffer so a long WS burst (e.g. during
+# reconnect) can't grow it unboundedly. 10 s is far more than any normal
+# response.
+MAX_BUFFERED_SAMPLES = SAMPLE_RATE * 10
+
 # Substrings that suggest a device is Bluetooth audio. macOS forces the
 # whole BT connection into low-quality HFP mode the moment any app opens
 # the BT device's mic — which is *the* reason AirPods get choppy on Macs
@@ -53,45 +66,43 @@ _BT_HINTS = ("airpods", "bluetooth", "buds", "beats", "headset")
 
 
 def _pick_input_device() -> Optional[int]:
-    """Return a sounddevice device index for the mic, or None for default.
+    """Pick a non-Bluetooth mic for the agent, unconditionally.
 
-    If the system's default *output* looks like Bluetooth, find a non-BT
-    input device (built-in mic, USB mic, etc.) so the BT link stays in
-    high-quality A2DP for output.
+    Why not respect the system default? Because macOS silently switches
+    the default input to AirPods the moment they connect, regardless of
+    what you set in Sound preferences. Any BT mic capture then forces the
+    connection into low-quality HFP mode and trashes the output. So we
+    always look for a built-in / USB / wired mic and pin to that.
+
+    Preference order:
+      1. Built-in MacBook mic ("MacBook Pro Microphone", "Built-in Mic", …)
+      2. Other non-Bluetooth input (USB, wired headset, etc.)
+      3. None — meaning no non-BT mic exists; caller falls through to
+         the system default and prints a warning.
     """
-    try:
-        default_out = sd.default.device[1]
-        if default_out is None or default_out < 0:
-            return None
-        out_name = (sd.query_devices(default_out).get("name") or "").lower()
-    except Exception:
-        return None
-
-    if not any(h in out_name for h in _BT_HINTS):
-        return None  # output isn't BT — system default mic is fine
-
     try:
         devices = sd.query_devices()
     except Exception:
         return None
 
-    candidates = []
+    non_bt = []
     for i, dev in enumerate(devices):
         if dev.get("max_input_channels", 0) < 1:
             continue
         name = (dev.get("name") or "").lower()
         if any(h in name for h in _BT_HINTS):
             continue
-        candidates.append((i, name))
+        non_bt.append((i, name))
 
-    # Prefer the built-in mic over weirder virtual devices (e.g. Continuity
-    # Camera mic is also non-BT but flaky).
+    # Prefer the built-in mic over USB or virtual devices (e.g. Continuity
+    # Camera's "me Microphone" is non-BT but routes via the network and is
+    # less reliable than the local hardware mic).
     preferred = ("macbook", "built-in", "built in", "internal")
-    for i, name in candidates:
+    for i, name in non_bt:
         if any(p in name for p in preferred):
             return i
 
-    return candidates[0][0] if candidates else None
+    return non_bt[0][0] if non_bt else None
 
 TOOLS = [
     {
@@ -173,8 +184,14 @@ class AraAgent:
         # drains this every audio tick, so CoreAudio (and Bluetooth) get a
         # steady byte stream instead of start/stop sessions per chunk.
         self._play_buffer: "collections.deque[np.ndarray]" = collections.deque()
-        self._play_buffer_pos: int = 0  # position inside the front chunk
+        self._play_buffer_pos: int = 0   # position inside the front chunk
+        self._buffered_samples: int = 0  # running total for O(1) preroll check
+        self._is_streaming: bool = False # past pre-roll? toggles on underrun
         self._play_lock = threading.Lock()
+        # Audio-thread → asyncio-thread status pipe. The callback stashes
+        # PortAudio's status flags here instead of calling print() directly,
+        # which would block the realtime thread and worsen underruns.
+        self._audio_status_pending: Optional[str] = None
         # Called whenever the agent transitions states (idle/listening/thinking/speaking).
         # Invoked on the asyncio thread, so the listener must marshal back to main if needed.
         self._state_callback = state_callback or (lambda _state: None)
@@ -196,6 +213,8 @@ class AraAgent:
         with self._play_lock:
             self._play_buffer.clear()
             self._play_buffer_pos = 0
+            self._buffered_samples = 0
+            self._is_streaming = False
         if self.ws is not None:
             await self.ws.close()
 
@@ -247,10 +266,23 @@ class AraAgent:
         """
 
         def on_audio(outdata, frames, time, status):
-            # Runs on CoreAudio's realtime thread — keep this lean.
+            # Runs on CoreAudio's realtime thread. NEVER call print() or any
+            # blocking I/O here — that would slow the audio thread and cascade
+            # underruns. Just stash flags for the watcher to log later.
             if status:
-                print(f"Output status: {status}")
+                self._audio_status_pending = str(status)
+
             with self._play_lock:
+                # Pre-roll gate: don't start streaming until we have a cushion
+                # of audio buffered. Once response.done, drain whatever's
+                # left immediately — no point pre-rolling the tail.
+                if not self._is_streaming:
+                    if (self._buffered_samples < PREROLL_SAMPLES
+                            and self._response_active):
+                        outdata[:, 0] = 0
+                        return
+                    self._is_streaming = True
+
                 idx = 0
                 while idx < frames and self._play_buffer:
                     chunk = self._play_buffer[0]
@@ -261,11 +293,16 @@ class AraAgent:
                     ]
                     idx += take
                     self._play_buffer_pos += take
+                    self._buffered_samples -= take
                     if self._play_buffer_pos >= len(chunk):
                         self._play_buffer.popleft()
                         self._play_buffer_pos = 0
+
                 if idx < frames:
-                    outdata[idx:, 0] = 0  # silence-pad rather than underrun
+                    # Underrun — pad with silence and drop back into pre-roll
+                    # mode so we re-accumulate a cushion before resuming.
+                    outdata[idx:, 0] = 0
+                    self._is_streaming = False
 
         # Grace period for an empty buffer before we assume response.done
         # was missed and force-recover the state. Natural mid-response
@@ -290,6 +327,12 @@ class AraAgent:
 
             while self.is_running:
                 await asyncio.sleep(0.05)
+
+                # Drain any audio-thread status flags (safe to log from here).
+                if self._audio_status_pending:
+                    print(f"⚠️  Audio: {self._audio_status_pending}")
+                    self._audio_status_pending = None
+
                 with self._play_lock:
                     has_audio = bool(self._play_buffer)
 
@@ -324,7 +367,14 @@ class AraAgent:
                     audio = np.frombuffer(audio_bytes, dtype=np.int16)
                     self._response_active = True
                     with self._play_lock:
+                        # Cap buffer size — drop oldest if pathologically large.
+                        while (self._buffered_samples + len(audio)
+                                > MAX_BUFFERED_SAMPLES and self._play_buffer):
+                            old = self._play_buffer.popleft()
+                            self._buffered_samples -= (len(old) - self._play_buffer_pos)
+                            self._play_buffer_pos = 0
                         self._play_buffer.append(audio)
+                        self._buffered_samples += len(audio)
                     # State="speaking" is set by the player's watcher loop
                     # once the audio actually starts feeding the OutputStream.
 
@@ -426,6 +476,9 @@ class AraAgent:
         with self._play_lock:
             self._play_buffer.clear()
             self._play_buffer_pos = 0
+            self._buffered_samples = 0
+            self._is_streaming = False
+        self._audio_status_pending = None
         self.is_running = True
 
         def _enqueue_mic(chunk):
@@ -446,10 +499,12 @@ class AraAgent:
         if input_device is not None:
             try:
                 mic_name = sd.query_devices(input_device)["name"]
-                print(f"\U0001f3a7 Using mic: {mic_name} "
-                      f"(keeps Bluetooth output in A2DP — avoids HFP downgrade)")
+                print(f"\U0001f3a7 Mic: {mic_name}  (pinned non-Bluetooth)")
             except Exception:
                 pass
+        else:
+            print("⚠️  No non-Bluetooth mic found — using system default. "
+                  "Bluetooth output may degrade to HFP.")
 
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
