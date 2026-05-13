@@ -11,8 +11,18 @@ console = Console()
 
 
 @app.command()
-def start():
+def start(
+    menu: bool = typer.Option(
+        False, "--menu", "-m",
+        help="Launch as a macOS menu bar app (with an animated blackhole icon).",
+    ),
+):
     """Start talking to Ara"""
+    if menu:
+        from ara_agent.menu_bar import run_menu_bar
+        run_menu_bar()
+        return
+
     console.print(Panel.fit(
         "[bold cyan]Ara[/bold cyan] — Voice-first Grok agent\n\n"
         "Just start speaking. She can run commands, read files, and help you.\n"
