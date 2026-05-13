@@ -75,6 +75,40 @@ TOOLS = [
             "type": "object",
             "properties": {"path": {"type": "string"}}
         }
+    },
+    {
+        "type": "function",
+        "name": "open_app",
+        "description": "Open a macOS application by name (e.g. 'Safari', 'Notes', 'Terminal', 'Music').",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "description": "The name of the application to open, as it appears in /Applications."
+                }
+            },
+            "required": ["app_name"]
+        }
+    },
+    {
+        "type": "function",
+        "name": "run_applescript",
+        "description": (
+            "Execute arbitrary AppleScript on the local macOS machine. "
+            "Powerful — can control any scriptable app, system settings, files, and UI. "
+            "Use for anything beyond simple app launching."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "script": {
+                    "type": "string",
+                    "description": "The AppleScript source to run (will be passed to osascript -e)."
+                }
+            },
+            "required": ["script"]
+        }
     }
 ]
 
@@ -190,6 +224,38 @@ class AraAgent:
                 return "\n".join(os.listdir(path))
             except Exception as e:
                 return f"Error: {str(e)}"
+
+        elif name == "open_app":
+            import subprocess
+            app_name = args["app_name"]
+            try:
+                # `open -a` resolves the app by display name; non-zero exit means not found.
+                result = subprocess.run(
+                    ["open", "-a", app_name],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    return f"Opened {app_name}."
+                return f"Could not open {app_name}: {result.stderr.strip() or 'unknown error'}"
+            except Exception as e:
+                return f"Error opening {app_name}: {str(e)}"
+
+        elif name == "run_applescript":
+            import subprocess
+            script = args["script"]
+            try:
+                # osascript -e accepts the script inline; stdout carries the result,
+                # stderr carries compilation/runtime errors.
+                result = subprocess.run(
+                    ["osascript", "-e", script],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if result.returncode == 0:
+                    return result.stdout.strip() or "(script ran, no output)"
+                return f"AppleScript error: {result.stderr.strip()}"
+            except Exception as e:
+                return f"Error running AppleScript: {str(e)}"
+
         return "Unknown tool"
 
     async def run(self):
@@ -203,20 +269,24 @@ class AraAgent:
             return
 
         self.loop = asyncio.get_running_loop()
-        self.mic_queue = asyncio.Queue(maxsize=100)
+        # ~10 s of audio buffer at default sounddevice blocksize/24 kHz.
+        self.mic_queue = asyncio.Queue(maxsize=500)
         self.playback_queue = asyncio.Queue()
         self.is_running = True
+
+        def _enqueue_mic(chunk):
+            # Runs on the asyncio loop thread; QueueFull is raised here, not at
+            # call_soon_threadsafe, so this is where we have to catch it.
+            try:
+                self.mic_queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                pass  # drop chunk under backpressure
 
         def audio_callback(indata, frames, time, status):
             # Runs in sounddevice's CFFI thread — no asyncio loop here.
             if status:
                 print(status)
-            try:
-                self.loop.call_soon_threadsafe(
-                    self.mic_queue.put_nowait, indata[:, 0].copy()
-                )
-            except asyncio.QueueFull:
-                pass  # drop chunk under backpressure
+            self.loop.call_soon_threadsafe(_enqueue_mic, indata[:, 0].copy())
 
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
