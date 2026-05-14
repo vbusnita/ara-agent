@@ -212,11 +212,19 @@ class OverlayController(NSObject):
             start.setTarget_(self)
             menu.addItem_(start)
         else:
-            shot = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Take Screenshot…", "takeScreenshot:", ""
+            text_shot = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Capture Text…", "captureText:", ""
             )
-            shot.setTarget_(self)
-            menu.addItem_(shot)
+            text_shot.setTarget_(self)
+            menu.addItem_(text_shot)
+
+            img_shot = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Capture Image…", "captureImage:", ""
+            )
+            img_shot.setTarget_(self)
+            menu.addItem_(img_shot)
+
+            menu.addItem_(NSMenuItem.separatorItem())
 
             stop = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
                 "Stop Listening", "stopAgent:", ""
@@ -248,14 +256,28 @@ class OverlayController(NSObject):
     def stopAgent_(self, _sender):
         self._shutdown_agent()
 
-    def takeScreenshot_(self, _sender):
+    def captureText_(self, _sender):
+        """OCR mode: local Apple Vision text recognition. Fast, no API
+        call, no token cost. Best for code, errors, prose."""
         loop = self._agent_loop
         agent = self._agent
         if not (loop and agent and loop.is_running()):
-            print("Start listening before taking a screenshot.")
+            print("Start listening before capturing.")
             return
         asyncio.run_coroutine_threadsafe(
             agent.request_screenshot_context(), loop
+        )
+
+    def captureImage_(self, _sender):
+        """Image mode: send the shot to xAI grok-4.3 for a visual
+        description. Slower, costs tokens — use when graphics matter."""
+        loop = self._agent_loop
+        agent = self._agent
+        if not (loop and agent and loop.is_running()):
+            print("Start listening before capturing.")
+            return
+        asyncio.run_coroutine_threadsafe(
+            agent.request_screenshot_description(), loop
         )
 
     def quitApp_(self, _sender):

@@ -30,7 +30,7 @@ except AttributeError:  # Pillow <9.1
 
 
 # Bump this when changing the look so stale frames get regenerated.
-ICON_VERSION = "v7"
+ICON_VERSION = "v8"
 
 # Source PNGs are sized to look crisp at both UIs that consume them:
 #   menu bar  — displayed at ~24 pt
@@ -133,22 +133,23 @@ _FADE_MASK: Optional[Image.Image] = None
 
 def _fade_mask() -> Image.Image:
     """A soft circular alpha mask: solid in the center, fading to zero
-    just before the canvas edges. Multiplying the icon's alpha by this
-    guarantees the corners are fully transparent, no matter how far the
-    halo blur extends — so the overlay window never reveals its square
-    bounding box."""
+    well before the canvas edges. Multiplying the icon's alpha by this
+    guarantees the canvas edges and corners are perfectly transparent,
+    no matter how far the halo blur extends.
+
+    Geometry: solid disk at r=0.45*WORK, sharp blur (sigma=0.018*WORK).
+    Combined with erfc falloff, this gives ~95% transparency at r=0.49
+    (i.e. before reaching the inscribed-circle edge at r=0.5), so the
+    halo's blur tail never bleeds into the canvas-edge midpoints — which
+    used to be the source of the faint square outline at peak halo."""
     global _FADE_MASK
     if _FADE_MASK is None:
         img = Image.new("L", (WORK, WORK), 0)
         d = ImageDraw.Draw(img)
         cx = cy = WORK / 2
-        # Solid disk covers most of the canvas; soft edge falls off before
-        # reaching the corner. The diagonal-to-center distance is ~0.707
-        # of the half-width, so a radius of 0.5*WORK is still safe — but
-        # we go a touch smaller to leave room for the blur to taper.
-        r = WORK * 0.48
+        r = WORK * 0.45
         d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
-        img = img.filter(ImageFilter.GaussianBlur(radius=WORK * 0.04))
+        img = img.filter(ImageFilter.GaussianBlur(radius=WORK * 0.018))
         _FADE_MASK = img
     return _FADE_MASK
 
@@ -202,24 +203,28 @@ def _idle(t: float) -> Image.Image:
 def _listening(t: float) -> Image.Image:
     """Active attention. Same event-horizon construction as idle, but the
     ring pulses wider and brighter, the halo intensifies dramatically,
-    and the lensing arc rotates faster."""
+    and the lensing arc rotates faster.
+
+    Halo is drawn slightly more compact than idle but with higher alpha
+    so it reads as brighter without spreading past the fade mask."""
     pulse = 0.5 + 0.5 * math.sin(2 * math.pi * t)
-    r = WORK * (0.28 + 0.04 * pulse)
+    r = WORK * (0.27 + 0.035 * pulse)
     lensing_deg = (360 * t * 1.5) % 360
 
     layers = []
-    # Outer wide halo — visibly pulsing
-    layers.append(_ring(r + WORK * 0.14, WORK * 0.13,
-                        (*W, int(110 + 110 * pulse)),
-                        blur=WORK * 0.11))
+    # Outer halo — tighter spread than v7 (smaller blur, slightly closer
+    # to the icon) but brighter peak so the pulsing feeling is preserved.
+    layers.append(_ring(r + WORK * 0.10, WORK * 0.10,
+                        (*W, int(135 + 120 * pulse)),
+                        blur=WORK * 0.07))
     # Bright inner halo
-    layers.append(_ring(r + WORK * 0.05, WORK * 0.07,
-                        (*W, int(160 + 80 * pulse)),
-                        blur=WORK * 0.05))
+    layers.append(_ring(r + WORK * 0.04, WORK * 0.06,
+                        (*W, int(170 + 80 * pulse)),
+                        blur=WORK * 0.04))
     # Shadow at center
     layers.append(_shadow_disk(r * 0.85, alpha=120))
     # Photon ring full circumference
-    layers.append(_ring(r, WORK * 0.028, (*W, 175)))
+    layers.append(_ring(r, WORK * 0.028, (*W, 180)))
     # Bright lensing arc, more prominent than idle
     layers.append(_arc(r, WORK * 0.05,
                        lensing_deg - 80, lensing_deg + 80,

@@ -17,6 +17,7 @@ dependencies = [
     "keyring>=24.0",
     "rumps>=0.4.0",
     "Pillow>=10.0",
+    "pyobjc-framework-Vision>=10.0",
 ]
 
 [project.scripts]

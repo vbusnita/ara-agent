@@ -45,19 +45,28 @@ MODEL = "grok-voice-latest"
 ENDPOINT = f"wss://api.x.ai/v1/realtime?model={MODEL}"
 SAMPLE_RATE = 24000
 
-# Jitter-buffer pre-roll: don't start playing until ~500ms of audio has
+# Jitter-buffer pre-roll: don't start playing until ~800ms of audio has
 # accumulated at the START of each response. After that, mid-stream
 # underruns silence-pad just the missing samples and resume immediately
 # — they do NOT re-engage pre-roll, because doing so turns a 40ms WS
-# hiccup into a 540ms audible gap (the actual cause of the residual
-# choppiness through v1).
-PREROLL_MS = 500
+# hiccup into a long audible gap.
+#
+# 800ms is chosen to absorb most observed server-side TTS hiccups and
+# typical network jitter. Beyond this, the remaining audio gaps are
+# either truly long server pauses, AirPods firmware quirks (verified
+# Beats don't have them), or environmental network issues.
+PREROLL_MS = 800
 PREROLL_SAMPLES = SAMPLE_RATE * PREROLL_MS // 1000
 
-# Hard cap on the playback ring buffer so a long WS burst (e.g. during
-# reconnect) can't grow it unboundedly. 10 s is far more than any normal
-# response.
-MAX_BUFFERED_SAMPLES = SAMPLE_RATE * 10
+# Hard cap on the playback ring buffer. xAI's TTS server frequently
+# bursts audio at 2-3× real-time, so a 50s response can land 30s+ of
+# pending audio in the buffer mid-stream — the previous 10s cap was
+# dropping that excess and causing audible mid-word audio skips
+# (perceived as "random blanks", confirmed via deficit -35s in
+# telemetry). 180s is large enough to hold any realistic single
+# response in full while still bounding memory (~8.6 MB) against a
+# runaway server.
+MAX_BUFFERED_SAMPLES = SAMPLE_RATE * 180
 
 # Substrings that suggest a device is Bluetooth audio. macOS forces the
 # whole BT connection into low-quality HFP mode the moment any app opens
@@ -193,6 +202,13 @@ class AraAgent:
         # PortAudio's status flags here instead of calling print() directly,
         # which would block the realtime thread and worsen underruns.
         self._audio_status_pending: Optional[str] = None
+        # Counter of how many callback frames silence-padded because the
+        # buffer was empty mid-stream. Useful for diagnosing whether
+        # audio gaps come from buffer starvation (our fault) or from the
+        # device side (BT/AirPods hardware quirk).
+        self._underrun_frames: int = 0
+        # Per-response telemetry — reset on response.created.
+        self._resp_stats: dict = {}
         # Called whenever the agent transitions states (idle/listening/thinking/speaking).
         # Invoked on the asyncio thread, so the listener must marshal back to main if needed.
         self._state_callback = state_callback or (lambda _state: None)
@@ -220,15 +236,17 @@ class AraAgent:
             await self.ws.close()
 
     async def request_screenshot_context(self) -> None:
-        """User-triggered (e.g. from the overlay menu): capture a window
-        screenshot, describe it via xAI vision, and inject the description
-        as a user message in the realtime conversation so Ara can talk
-        about what's on screen.
+        """User-triggered (e.g. from the overlay menu): launch the macOS
+        interactive screenshot (region or window — Space toggles), OCR
+        the result locally via Apple Vision, and inject the recognized
+        text into the realtime conversation as user context.
 
-        The realtime voice API can't ingest images directly, so we OCR-like
-        the screenshot through grok-2-vision and feed the text result.
+        Local OCR instead of a vision REST call: ~10× faster end to end,
+        no token cost, ~1000× less payload (text bytes vs. base64 image),
+        and crucially no asyncio-executor GIL contention that used to
+        chop audio mid-response.
         """
-        from ara_agent.screenshot import capture_and_describe
+        from ara_agent.screenshot import capture_and_extract_text
 
         if self.ws is None:
             return
@@ -236,13 +254,23 @@ class AraAgent:
         self._set_state("thinking")
         triggered_response = False
         try:
-            description = await capture_and_describe(XAI_API_KEY)
-            if not description:
+            text = await capture_and_extract_text()
+            if not text:
                 return
-            print(f"\U0001f4f8 Screenshot: {description}")
+            # Single-line summary only — the full text goes to Ara via the WS
+            # injection. Dumping multi-line code/text into the terminal is
+            # noisy and leaks whatever's on the user's screen into stdout.
+            first_line = text.split("\n", 1)[0].strip()[:80]
+            line_count = text.count("\n") + 1
+            print(
+                f"\U0001f4f8 Captured {len(text)} chars / {line_count} lines"
+                + (f" — \"{first_line}…\"" if first_line else "")
+            )
             framed = (
-                "[The user just shared a screenshot of their screen. "
-                f"Here is what is visible in it: {description}]"
+                "[The user just captured text from a region of their screen. "
+                "Here is exactly what the screen shows:\n\n"
+                f"{text}\n\n"
+                "Use this as context for what they're asking about.]"
             )
             await self.ws.send(json.dumps({
                 "type": "conversation.item.create",
@@ -260,6 +288,49 @@ class AraAgent:
             # If we didn't kick off a response, revert state ourselves. If
             # we did, the player's watcher will transition us out of
             # thinking when audio starts arriving.
+            if not triggered_response and not self._response_active:
+                self._set_state("listening")
+
+    async def request_screenshot_description(self) -> None:
+        """User-triggered alternate to text capture: take the same
+        interactive screenshot, but send the image to xAI grok-4.3 for a
+        2-3 sentence visual description, then inject that description as
+        user context.
+
+        Use this when the screen has graphics that matter (charts, UI
+        layout, diagrams) and the literal text alone wouldn't capture
+        what the user is asking about. Slower than OCR and costs tokens,
+        so prefer text mode by default.
+        """
+        from ara_agent.screenshot import capture_and_describe
+
+        if self.ws is None:
+            return
+
+        self._set_state("thinking")
+        triggered_response = False
+        try:
+            description = await capture_and_describe(XAI_API_KEY)
+            if not description:
+                return
+            print(f"\U0001f5bc️  Screen description: {description}")
+            framed = (
+                "[The user just shared a screenshot of their screen. "
+                f"Here is what is visible in it: {description}]"
+            )
+            await self.ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": framed}],
+                },
+            }))
+            await self.ws.send(json.dumps({"type": "response.create"}))
+            triggered_response = True
+        except Exception as e:
+            print(f"⚠️  Image-describe flow failed: {type(e).__name__}: {e}")
+        finally:
             if not triggered_response and not self._response_active:
                 self._set_state("listening")
 
@@ -318,16 +389,30 @@ class AraAgent:
                 self._audio_status_pending = str(status)
 
             with self._play_lock:
-                # Pre-roll gate: don't start streaming until we have a cushion
-                # of audio buffered. Once response.done, drain whatever's
-                # left immediately — no point pre-rolling the tail.
+                # Case 1: nothing buffered. Silence-pad and return.
+                # Critical: don't touch _is_streaming here — if we set it
+                # True during idle, (a) idle frames falsely count as
+                # underruns (inflated starvation telemetry), and (b) the
+                # next response bypasses pre-roll entirely.
+                if self._buffered_samples == 0:
+                    outdata[:, 0] = 0
+                    if self._is_streaming:
+                        # Genuinely mid-stream underrun — count it.
+                        self._underrun_frames += frames
+                    return
+
+                # Case 2: have audio. If we haven't started streaming
+                # this response yet, gate on pre-roll cushion.
                 if not self._is_streaming:
                     if (self._buffered_samples < PREROLL_SAMPLES
                             and self._response_active):
                         outdata[:, 0] = 0
                         return
+                    # Pre-roll satisfied (or response already complete and
+                    # we're just draining the tail) — start streaming.
                     self._is_streaming = True
 
+                # Drain buffer into outdata.
                 idx = 0
                 while idx < frames and self._play_buffer:
                     chunk = self._play_buffer[0]
@@ -348,16 +433,16 @@ class AraAgent:
                     # and resume on the next callback as soon as data is
                     # available. Do NOT reset _is_streaming — that would
                     # re-engage pre-roll and extend a 40ms hiccup into a
-                    # 500ms gap. Pre-roll is only for the start of each
-                    # response, where bursty initial arrival is normal.
+                    # long gap.
                     outdata[idx:, 0] = 0
+                    self._underrun_frames += (frames - idx)
 
-        # Grace period for an empty buffer before we assume response.done
-        # was missed and force-recover the state. Natural mid-response
-        # pauses are encoded as silence inside chunks (buffer stays
-        # non-empty), so this only kicks in when the server genuinely
-        # stopped streaming.
-        EMPTY_GRACE_SECONDS = 2.0
+        # Grace period for an empty buffer before we force the UI back
+        # to "listening" in case response.done never fires. Bumped from
+        # 2s → 5s because real responses can have mid-stream server
+        # pauses of 2-4 seconds (verified via per-response stats); 2s
+        # was triggering false-positive transitions during normal flow.
+        EMPTY_GRACE_SECONDS = 5.0
 
         with sd.OutputStream(
             samplerate=SAMPLE_RATE,
@@ -397,26 +482,82 @@ class AraAgent:
                     if empty_since is None:
                         empty_since = loop.time()
                     elapsed = loop.time() - empty_since
-                    if not self._response_active or elapsed > EMPTY_GRACE_SECONDS:
+                    response_truly_done = not self._response_active
+                    grace_fired = elapsed > EMPTY_GRACE_SECONDS
+
+                    if response_truly_done or grace_fired:
+                        # Report whether this response had buffer-starvation
+                        # gaps. >0ms means we ran out of data mid-response;
+                        # 0ms means cuts (if any) were downstream of us.
+                        if self._underrun_frames > 0:
+                            ms = self._underrun_frames * 1000 / SAMPLE_RATE
+                            print(f"⏱️  buffer-starvation this response: {ms:.0f} ms total")
+                        self._underrun_frames = 0
                         self._set_state("listening")
                         currently_playing = False
                         empty_since = None
-                        self._response_active = False  # un-stick if it was stuck
-                        # Reset for the next response so it gets its own
-                        # initial pre-roll cushion against bursty start.
-                        self._is_streaming = False
+                        # Critical: only reset preroll state if the response is
+                        # genuinely over (response.done fired). If we transition
+                        # via grace timeout but the server is still streaming,
+                        # the next chunk should resume playback IMMEDIATELY,
+                        # not wait another 800ms for pre-roll — that would
+                        # compound a 5s server gap into a 5.8s perceived gap.
+                        if response_truly_done:
+                            self._is_streaming = False
+                        else:
+                            # Force-clear stuck flag so next chunk's arrival
+                            # cleanly enters a new response cycle.
+                            self._response_active = False
+                            print("⚠️  Grace timeout fired with response still "
+                                  "active — server may have dropped response.done.")
 
     async def handle_messages(self):
+        loop = asyncio.get_running_loop()
         async for message in self.ws:
             data = json.loads(message)
+            msg_type = data["type"]
 
-            if data["type"] == "response.output_audio.delta":
+            if msg_type == "response.created":
+                # Reset per-response telemetry. start = when server signaled
+                # response begins; first_audio fills in when first chunk arrives.
+                self._resp_stats = {
+                    "start": loop.time(),
+                    "first_audio": None,
+                    "last_chunk": None,
+                    "count": 0,
+                    "samples": 0,
+                    "max_gap_ms": 0.0,
+                    "gaps_over_500ms": 0,
+                    "had_tool_call": False,
+                }
+                continue
+
+            if msg_type == "response.output_audio.delta":
                 # xAI/OpenAI realtime variants — accept either field name
                 audio_b64 = data.get("delta") or data.get("audio")
                 if audio_b64:
                     audio_bytes = base64.b64decode(audio_b64)
                     audio = np.frombuffer(audio_bytes, dtype=np.int16)
                     self._response_active = True
+
+                    # Telemetry: time of first chunk, inter-chunk gaps.
+                    now = loop.time()
+                    stats = self._resp_stats
+                    if stats:
+                        if stats["first_audio"] is None:
+                            stats["first_audio"] = now
+                            ttfb_ms = (now - stats["start"]) * 1000
+                            print(f"📊 First audio after {ttfb_ms:.0f}ms")
+                        elif stats["last_chunk"] is not None:
+                            gap_ms = (now - stats["last_chunk"]) * 1000
+                            if gap_ms > stats["max_gap_ms"]:
+                                stats["max_gap_ms"] = gap_ms
+                            if gap_ms > 500:
+                                stats["gaps_over_500ms"] += 1
+                        stats["last_chunk"] = now
+                        stats["count"] += 1
+                        stats["samples"] += len(audio)
+
                     with self._play_lock:
                         # Cap buffer size — drop oldest if pathologically large.
                         while (self._buffered_samples + len(audio)
@@ -429,10 +570,12 @@ class AraAgent:
                     # State="speaking" is set by the player's watcher loop
                     # once the audio actually starts feeding the OutputStream.
 
-            elif data["type"] == "response.function_call_arguments.done":
+            elif msg_type == "response.function_call_arguments.done":
                 tool_name = data["name"]
                 args = json.loads(data["arguments"])
                 print(f"\n\U0001f527 Tool call: {tool_name}({args})")
+                if self._resp_stats:
+                    self._resp_stats["had_tool_call"] = True
                 self._set_state("thinking")
 
                 result = await self.execute_tool(tool_name, args)
@@ -447,29 +590,50 @@ class AraAgent:
                     }
                 }))
 
-            elif data["type"] == "response.done":
+            elif msg_type == "response.done":
                 print("\n\U0001f5e3️  Ara finished speaking")
                 # Just flip the flag; the player will set state="listening"
                 # once the playback queue drains.
                 self._response_active = False
+                stats = self._resp_stats
+                if stats and stats.get("first_audio"):
+                    wall_ms = (loop.time() - stats["start"]) * 1000
+                    audio_ms = stats["samples"] * 1000 / SAMPLE_RATE
+                    deficit_ms = wall_ms - audio_ms
+                    tool_tag = " [tool call]" if stats["had_tool_call"] else ""
+                    print(
+                        f"📊 Response: {wall_ms:.0f}ms wall, {audio_ms:.0f}ms audio, "
+                        f"deficit {deficit_ms:+.0f}ms, {stats['count']} chunks, "
+                        f"max gap {stats['max_gap_ms']:.0f}ms, "
+                        f"{stats['gaps_over_500ms']} gaps>500ms{tool_tag}"
+                    )
 
     async def execute_tool(self, name: str, args: dict) -> str:
-        if name == "run_bash":
-            import subprocess
+        """Dispatch to a tool implementation. All implementations run in
+        the default executor (a background thread) — critical, because
+        synchronous subprocess.run inside the asyncio loop would block
+        WS message processing for the entire tool duration, starving
+        the audio playback buffer and producing audible 10+ second
+        silence gaps in Ara's response (verified via underrun counter).
+        """
+        import subprocess
+
+        def _run_bash():
             try:
-                result = subprocess.run(args["command"], shell=True, capture_output=True, text=True, timeout=30)
-                return f"stdout: {result.stdout}\nstderr: {result.stderr}\nexit: {result.returncode}"
+                r = subprocess.run(args["command"], shell=True,
+                                   capture_output=True, text=True, timeout=30)
+                return f"stdout: {r.stdout}\nstderr: {r.stderr}\nexit: {r.returncode}"
             except Exception as e:
                 return f"Error: {str(e)}"
 
-        elif name == "read_file":
+        def _read_file():
             try:
                 with open(args["path"], "r") as f:
                     return f.read()[:2000]
             except Exception as e:
                 return f"Error: {str(e)}"
 
-        elif name == "list_files":
+        def _list_files():
             import os
             path = args.get("path", ".")
             try:
@@ -477,38 +641,46 @@ class AraAgent:
             except Exception as e:
                 return f"Error: {str(e)}"
 
-        elif name == "open_app":
-            import subprocess
+        def _open_app():
             app_name = args["app_name"]
             try:
-                # `open -a` resolves the app by display name; non-zero exit means not found.
-                result = subprocess.run(
+                # `open -a` resolves by display name; non-zero exit = not found.
+                r = subprocess.run(
                     ["open", "-a", app_name],
                     capture_output=True, text=True, timeout=10,
                 )
-                if result.returncode == 0:
+                if r.returncode == 0:
                     return f"Opened {app_name}."
-                return f"Could not open {app_name}: {result.stderr.strip() or 'unknown error'}"
+                return f"Could not open {app_name}: {r.stderr.strip() or 'unknown error'}"
             except Exception as e:
                 return f"Error opening {app_name}: {str(e)}"
 
-        elif name == "run_applescript":
-            import subprocess
+        def _run_applescript():
             script = args["script"]
             try:
-                # osascript -e accepts the script inline; stdout carries the result,
-                # stderr carries compilation/runtime errors.
-                result = subprocess.run(
+                r = subprocess.run(
                     ["osascript", "-e", script],
                     capture_output=True, text=True, timeout=30,
                 )
-                if result.returncode == 0:
-                    return result.stdout.strip() or "(script ran, no output)"
-                return f"AppleScript error: {result.stderr.strip()}"
+                if r.returncode == 0:
+                    return r.stdout.strip() or "(script ran, no output)"
+                return f"AppleScript error: {r.stderr.strip()}"
             except Exception as e:
                 return f"Error running AppleScript: {str(e)}"
 
-        return "Unknown tool"
+        handlers = {
+            "run_bash": _run_bash,
+            "read_file": _read_file,
+            "list_files": _list_files,
+            "open_app": _open_app,
+            "run_applescript": _run_applescript,
+        }
+        handler = handlers.get(name)
+        if handler is None:
+            return "Unknown tool"
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, handler)
 
     async def run(self):
         try:
