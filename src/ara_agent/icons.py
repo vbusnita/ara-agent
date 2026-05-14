@@ -21,7 +21,7 @@ import math
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 try:
     LANCZOS = Image.Resampling.LANCZOS
@@ -30,7 +30,7 @@ except AttributeError:  # Pillow <9.1
 
 
 # Bump this when changing the look so stale frames get regenerated.
-ICON_VERSION = "v6"
+ICON_VERSION = "v7"
 
 # Source PNGs are sized to look crisp at both UIs that consume them:
 #   menu bar  — displayed at ~24 pt
@@ -126,6 +126,38 @@ def _stack(*layers: Image.Image) -> Image.Image:
     for layer in layers[1:]:
         base = Image.alpha_composite(base, layer)
     return base
+
+
+_FADE_MASK: Optional[Image.Image] = None
+
+
+def _fade_mask() -> Image.Image:
+    """A soft circular alpha mask: solid in the center, fading to zero
+    just before the canvas edges. Multiplying the icon's alpha by this
+    guarantees the corners are fully transparent, no matter how far the
+    halo blur extends — so the overlay window never reveals its square
+    bounding box."""
+    global _FADE_MASK
+    if _FADE_MASK is None:
+        img = Image.new("L", (WORK, WORK), 0)
+        d = ImageDraw.Draw(img)
+        cx = cy = WORK / 2
+        # Solid disk covers most of the canvas; soft edge falls off before
+        # reaching the corner. The diagonal-to-center distance is ~0.707
+        # of the half-width, so a radius of 0.5*WORK is still safe — but
+        # we go a touch smaller to leave room for the blur to taper.
+        r = WORK * 0.48
+        d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=255)
+        img = img.filter(ImageFilter.GaussianBlur(radius=WORK * 0.04))
+        _FADE_MASK = img
+    return _FADE_MASK
+
+
+def _apply_fade(img: Image.Image) -> Image.Image:
+    """Multiply the image's alpha channel by the circular fade mask."""
+    r, g, b, a = img.split()
+    a = ImageChops.multiply(a, _fade_mask())
+    return Image.merge("RGBA", (r, g, b, a))
 
 
 # NOTE: previous versions added a dark "void" disk at the center for the
@@ -274,6 +306,9 @@ def ensure_icons() -> Dict[str, List[str]]:
             path = CACHE_DIR / f"{state}_{i:02d}.png"
             if not path.exists():
                 large = fn(i / count)
+                # Mask before downsample so the circular fade is at full
+                # working resolution (sharper falloff after resize).
+                large = _apply_fade(large)
                 final = large.resize((SIZE, SIZE), LANCZOS)
                 final.save(path, optimize=True)
             paths.append(str(path))
