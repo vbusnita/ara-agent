@@ -16,8 +16,16 @@ def start(
         False, "--menu", "-m",
         help="Launch as a macOS menu bar app (with an animated blackhole icon).",
     ),
+    overlay: bool = typer.Option(
+        False, "--overlay", "-o",
+        help="Launch as a floating draggable blackhole overlay with a screenshot tool.",
+    ),
 ):
     """Start talking to Ara"""
+    if overlay:
+        from ara_agent.overlay import run_overlay
+        run_overlay()
+        return
     if menu:
         from ara_agent.menu_bar import run_menu_bar
         run_menu_bar()

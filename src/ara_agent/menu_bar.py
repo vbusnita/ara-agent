@@ -19,11 +19,12 @@ from typing import Dict, List, Optional
 import rumps
 from AppKit import NSImage
 
-from ara_agent.icons import DISPLAY_PT, ensure_icons
+from ara_agent.icons import ensure_icons
 from ara_agent.voice_agent import AraAgent
 
 
 TICK_SECONDS = 0.06  # ~16 fps
+MENU_BAR_PT = 24     # icon display size in the menu bar
 
 
 class AraMenuBar(rumps.App):
@@ -61,7 +62,7 @@ class AraMenuBar(rumps.App):
         img = NSImage.alloc().initWithContentsOfFile_(path)
         # Source PNGs are @2x; tell AppKit the on-screen size in points so
         # retina displays sample crisply and non-retina downsample cleanly.
-        img.setSize_((DISPLAY_PT, DISPLAY_PT))
+        img.setSize_((MENU_BAR_PT, MENU_BAR_PT))
         # Each frame is also a template — rumps sets this on the App's
         # initial icon, but we bypass that path when swapping frames
         # via setImage_, so set it explicitly per image.

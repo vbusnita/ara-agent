@@ -45,12 +45,13 @@ MODEL = "grok-voice-latest"
 ENDPOINT = f"wss://api.x.ai/v1/realtime?model={MODEL}"
 SAMPLE_RATE = 24000
 
-# Jitter-buffer pre-roll: don't start playing until ~180ms of audio has
-# accumulated. Absorbs WS arrival jitter and BT delivery variance — the
-# difference between "smooth" and "occasional micro-cuts" on Bluetooth.
-# Cost is ~180ms of added latency at the start of each response, which
-# is well below perceptible for conversational pacing.
-PREROLL_MS = 180
+# Jitter-buffer pre-roll: don't start playing until ~500ms of audio has
+# accumulated at the START of each response. After that, mid-stream
+# underruns silence-pad just the missing samples and resume immediately
+# — they do NOT re-engage pre-roll, because doing so turns a 40ms WS
+# hiccup into a 540ms audible gap (the actual cause of the residual
+# choppiness through v1).
+PREROLL_MS = 500
 PREROLL_SAMPLES = SAMPLE_RATE * PREROLL_MS // 1000
 
 # Hard cap on the playback ring buffer so a long WS burst (e.g. during
@@ -218,6 +219,50 @@ class AraAgent:
         if self.ws is not None:
             await self.ws.close()
 
+    async def request_screenshot_context(self) -> None:
+        """User-triggered (e.g. from the overlay menu): capture a window
+        screenshot, describe it via xAI vision, and inject the description
+        as a user message in the realtime conversation so Ara can talk
+        about what's on screen.
+
+        The realtime voice API can't ingest images directly, so we OCR-like
+        the screenshot through grok-2-vision and feed the text result.
+        """
+        from ara_agent.screenshot import capture_and_describe
+
+        if self.ws is None:
+            return
+
+        self._set_state("thinking")
+        triggered_response = False
+        try:
+            description = await capture_and_describe(XAI_API_KEY)
+            if not description:
+                return
+            print(f"\U0001f4f8 Screenshot: {description}")
+            framed = (
+                "[The user just shared a screenshot of their screen. "
+                f"Here is what is visible in it: {description}]"
+            )
+            await self.ws.send(json.dumps({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": framed}],
+                },
+            }))
+            await self.ws.send(json.dumps({"type": "response.create"}))
+            triggered_response = True
+        except Exception as e:
+            print(f"⚠️  Screenshot flow failed: {type(e).__name__}: {e}")
+        finally:
+            # If we didn't kick off a response, revert state ourselves. If
+            # we did, the player's watcher will transition us out of
+            # thinking when audio starts arriving.
+            if not triggered_response and not self._response_active:
+                self._set_state("listening")
+
     async def connect(self):
         headers = {"Authorization": f"Bearer {XAI_API_KEY}"}
         
@@ -299,10 +344,13 @@ class AraAgent:
                         self._play_buffer_pos = 0
 
                 if idx < frames:
-                    # Underrun — pad with silence and drop back into pre-roll
-                    # mode so we re-accumulate a cushion before resuming.
+                    # Mid-stream underrun: silence-pad the missing samples
+                    # and resume on the next callback as soon as data is
+                    # available. Do NOT reset _is_streaming — that would
+                    # re-engage pre-roll and extend a 40ms hiccup into a
+                    # 500ms gap. Pre-roll is only for the start of each
+                    # response, where bursty initial arrival is normal.
                     outdata[idx:, 0] = 0
-                    self._is_streaming = False
 
         # Grace period for an empty buffer before we assume response.done
         # was missed and force-recover the state. Natural mid-response
@@ -354,6 +402,9 @@ class AraAgent:
                         currently_playing = False
                         empty_since = None
                         self._response_active = False  # un-stick if it was stuck
+                        # Reset for the next response so it gets its own
+                        # initial pre-roll cushion against bursty start.
+                        self._is_streaming = False
 
     async def handle_messages(self):
         async for message in self.ws:
