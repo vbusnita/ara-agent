@@ -17,8 +17,11 @@ on the icon view.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from typing import Dict, List, Optional
+
+log = logging.getLogger(__name__)
 
 import objc
 from AppKit import (
@@ -43,6 +46,7 @@ from PyObjCTools import AppHelper
 
 from ara_agent.hotkeys import GlobalHotkey
 from ara_agent.icons import ensure_icons
+from ara_agent.output_hud import OutputHUD
 from ara_agent.rotary_hud import RotaryHUD
 from ara_agent.voice_agent import AraAgent
 
@@ -191,6 +195,10 @@ class OverlayController(NSObject):
         # Rotary HUD for hotkey-driven action selection.
         self._rotary = RotaryHUD.alloc().init()
 
+        # Output HUD — persistent activity panel at bottom-middle of the
+        # overlay's screen. Auto-shows on listening, hides on stop.
+        self._output_hud = OutputHUD.alloc().initWithAnchor_(self._panel)
+
         # Global hotkey: Cmd+Shift+A cycles the rotary HUD. Implemented
         # via Carbon's RegisterEventHotKey — no macOS permission needed.
         self._hotkey = GlobalHotkey(on_press=self._on_hotkey)
@@ -217,6 +225,14 @@ class OverlayController(NSObject):
         if state != self._state:
             self._state = state
             self._frame_idx = 0
+        # Always forward to the HUD — even if same state, it's harmless,
+        # and the HUD may have been freshly shown and missed the last set.
+        if self._output_hud is not None:
+            self._output_hud.set_state(state)
+
+    def _on_agent_event(self, kind, text):
+        if self._output_hud is not None:
+            self._output_hud.log_event(kind, text)
 
     # ---- hotkey ----
 
@@ -299,6 +315,8 @@ class OverlayController(NSObject):
         if self._agent_thread and self._agent_thread.is_alive():
             return
         self._on_agent_state("listening")
+        if self._output_hud is not None:
+            self._output_hud.show()
         self._agent_thread = threading.Thread(
             target=self._run_agent, daemon=True
         )
@@ -360,19 +378,25 @@ class OverlayController(NSObject):
     # ---- agent lifecycle (background thread) ----
 
     def _run_agent(self):
+        log.info("agent thread starting")
         self._agent_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._agent_loop)
-        self._agent = AraAgent(state_callback=self._on_agent_state)
+        self._agent = AraAgent(
+            state_callback=self._on_agent_state,
+            event_callback=self._on_agent_event,
+        )
         try:
             self._agent_loop.run_until_complete(self._agent.run())
+            log.info("agent thread completed normally")
         except Exception as e:
+            log.exception("agent thread raised — top-level catch")
             print(f"Voice agent error: {type(e).__name__}: {e}")
         finally:
             self._on_agent_state("idle")
             try:
                 self._agent_loop.close()
             except Exception:
-                pass
+                log.exception("error closing agent loop")
             self._agent_loop = None
             self._agent = None
 
@@ -382,6 +406,8 @@ class OverlayController(NSObject):
         if loop and agent and loop.is_running():
             asyncio.run_coroutine_threadsafe(agent.stop(), loop)
         self._on_agent_state("idle")
+        if self._output_hud is not None:
+            self._output_hud.hide()
 
 
 def run_overlay():

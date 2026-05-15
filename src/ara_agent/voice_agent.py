@@ -6,12 +6,14 @@ Core real-time voice client using xAI Voice Agent API
 import asyncio
 import base64
 import collections
+import getpass
 import json
+import logging
 import os
 import threading
 from typing import Callable, Optional
 
-import getpass
+log = logging.getLogger(__name__)
 
 import websockets
 import sounddevice as sd
@@ -44,6 +46,66 @@ VOICE = "ara"
 MODEL = "grok-voice-latest"
 ENDPOINT = f"wss://api.x.ai/v1/realtime?model={MODEL}"
 SAMPLE_RATE = 24000
+
+# Environment context exposed to Ara in the system prompt so she can
+# refer to the right paths (instead of guessing or using literal "~"
+# which subprocess.run / open() don't expand without shell=True).
+USER_NAME = getpass.getuser()
+HOME_DIR = os.path.expanduser("~")
+LAUNCH_CWD = os.getcwd()
+
+
+def _normalize_path(p: str) -> str:
+    """Expand ~ and $VAR in a user-supplied path. Tools that call
+    open()/os.listdir() directly need this since shell expansion only
+    happens for subprocess.run(shell=True)."""
+    if not p:
+        return p
+    return os.path.expanduser(os.path.expandvars(p))
+
+
+def _format_tool_call(tool_name: str, args: dict) -> str:
+    """Terminal-style representation of a tool call for the HUD.
+    bash commands look like `$ cmd`; other tools as `tool args`."""
+    if tool_name == "run_bash":
+        return f"$ {args.get('command', '')}"
+    if tool_name == "read_file":
+        return f"read  {args.get('path', '')}"
+    if tool_name == "list_files":
+        return f"ls    {args.get('path', '.')}"
+    if tool_name == "open_app":
+        return f"open  {args.get('app_name', '')}"
+    if tool_name == "run_applescript":
+        snippet = (args.get("script", "") or "").split("\n")[0]
+        return f"osascript  {snippet}"
+    flat = ", ".join(f"{k}={v!r}" for k, v in args.items())
+    return f"{tool_name}  {flat}"
+
+
+def _clean_tool_result(result: str) -> str:
+    """Strip the verbose 'stdout: / stderr: / exit:' framing from
+    run_bash results so the HUD shows just the actual output, the way
+    you'd see it in a real terminal."""
+    if not result:
+        return ""
+    # run_bash result format: "stdout: <s>\nstderr: <s>\nexit: <n>"
+    if result.startswith("stdout: "):
+        lines = result.split("\n")
+        stdout_part = ""
+        stderr_part = ""
+        for line in lines:
+            if line.startswith("stdout: "):
+                stdout_part = line[len("stdout: "):]
+            elif line.startswith("stderr: "):
+                stderr_part = line[len("stderr: "):]
+            # ignore "exit: N" — exit code rarely interesting interactively
+        pieces = []
+        if stdout_part:
+            pieces.append(stdout_part)
+        if stderr_part:
+            pieces.append(stderr_part)
+        return "\n".join(pieces) if pieces else ""
+    return result
 
 # Jitter-buffer pre-roll: don't start playing until ~800ms of audio has
 # accumulated at the START of each response. After that, mid-stream
@@ -185,7 +247,11 @@ TOOLS = [
 
 
 class AraAgent:
-    def __init__(self, state_callback: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        state_callback: Optional[Callable[[str], None]] = None,
+        event_callback: Optional[Callable[[str, str], None]] = None,
+    ):
         self.ws = None
         self.is_running = False
         self.loop: Optional[asyncio.AbstractEventLoop] = None
@@ -212,6 +278,11 @@ class AraAgent:
         # Called whenever the agent transitions states (idle/listening/thinking/speaking).
         # Invoked on the asyncio thread, so the listener must marshal back to main if needed.
         self._state_callback = state_callback or (lambda _state: None)
+        # Called when something noteworthy happens — tool calls, results,
+        # screenshot captures. Args: (kind, text) where kind is one of
+        # "call" / "result" / "say" / "info" / "warn". Same threading
+        # caveat as state_callback.
+        self._event_callback = event_callback or (lambda _k, _t: None)
         # True between the first audio chunk of a response and response.done.
         # Used by the player to avoid flickering to "listening" between audio chunks.
         self._response_active = False
@@ -221,6 +292,14 @@ class AraAgent:
             self._state_callback(state)
         except Exception:
             pass  # never let UI errors kill the audio loop
+
+    def _emit_event(self, kind: str, text: str) -> None:
+        """Fire a UI event for surfaces like the Output HUD. Swallows
+        all exceptions so a broken UI never crashes the audio loop."""
+        try:
+            self._event_callback(kind, text)
+        except Exception:
+            pass
 
     async def stop(self) -> None:
         """Cleanly shut down: stop loops and close the WS so run() returns."""
@@ -254,17 +333,15 @@ class AraAgent:
         self._set_state("thinking")
         triggered_response = False
         try:
+            self._emit_event("info", "Capturing screen text…")
             text = await capture_and_extract_text()
             if not text:
+                self._emit_event("info", "Capture cancelled")
                 return
-            # Single-line summary only — the full text goes to Ara via the WS
-            # injection. Dumping multi-line code/text into the terminal is
-            # noisy and leaks whatever's on the user's screen into stdout.
-            first_line = text.split("\n", 1)[0].strip()[:80]
             line_count = text.count("\n") + 1
-            print(
-                f"\U0001f4f8 Captured {len(text)} chars / {line_count} lines"
-                + (f" — \"{first_line}…\"" if first_line else "")
+            self._emit_event(
+                "info",
+                f"OCR  {len(text)} chars / {line_count} lines",
             )
             framed = (
                 "[The user just captured text from a region of their screen. "
@@ -330,10 +407,14 @@ class AraAgent:
         self._set_state("thinking")
         triggered_response = False
         try:
+            self._emit_event("info", "Describing image…")
             description = await capture_and_describe(XAI_API_KEY)
             if not description:
+                self._emit_event("info", "Capture cancelled")
                 return
-            print(f"\U0001f5bc️  Screen description: {description}")
+            self._emit_event(
+                "info", f"Image  {description[:120]}",
+            )
             framed = (
                 "[The user just shared a screenshot of their screen. "
                 f"Here is what is visible in it: {description}]"
@@ -368,6 +449,10 @@ class AraAgent:
                     "You are Ara, a warm, friendly, and highly competent macOS sysadmin. "
                     "Speak naturally and conversationally. Be helpful and concise. "
                     "You can run bash commands, read files, and explore the system. "
+                    f"You're running on {USER_NAME}'s Mac. "
+                    f"Their home directory is {HOME_DIR}. "
+                    f"You were launched from {LAUNCH_CWD}. "
+                    "Use absolute paths in tool calls (not '~'). "
                     "Always warn before running potentially destructive commands."
                 ),
                 "turn_detection": {"type": "server_vad"},
@@ -593,13 +678,21 @@ class AraAgent:
             elif msg_type == "response.function_call_arguments.done":
                 tool_name = data["name"]
                 args = json.loads(data["arguments"])
-                print(f"\n\U0001f527 Tool call: {tool_name}({args})")
+                log.info("tool call: %s args=%r", tool_name, args)
+                self._emit_event("call", _format_tool_call(tool_name, args))
                 if self._resp_stats:
                     self._resp_stats["had_tool_call"] = True
                 self._set_state("thinking")
 
-                result = await self.execute_tool(tool_name, args)
-                print(f"   Result: {result[:150]}...")
+                try:
+                    result = await self.execute_tool(tool_name, args)
+                except Exception as e:
+                    log.exception("tool %r raised", tool_name)
+                    result = f"Error: {type(e).__name__}: {e}"
+                log.info("tool result (%s): %d chars", tool_name, len(result))
+                # Full result text goes to the HUD; the HUD truncates for
+                # display but stores everything in its scrollable log.
+                self._emit_event("result", _clean_tool_result(result))
 
                 await self.ws.send(json.dumps({
                     "type": "conversation.item.create",
@@ -611,9 +704,7 @@ class AraAgent:
                 }))
 
             elif msg_type == "response.done":
-                print("\n\U0001f5e3️  Ara finished speaking")
-                # Just flip the flag; the player will set state="listening"
-                # once the playback queue drains.
+                # State transitions through the HUD now; no need to print.
                 self._response_active = False
                 stats = self._resp_stats
                 if stats and stats.get("first_audio"):
@@ -648,14 +739,15 @@ class AraAgent:
 
         def _read_file():
             try:
-                with open(args["path"], "r") as f:
+                path = _normalize_path(args["path"])
+                with open(path, "r") as f:
                     return f.read()[:2000]
             except Exception as e:
                 return f"Error: {str(e)}"
 
         def _list_files():
             import os
-            path = args.get("path", ".")
+            path = _normalize_path(args.get("path", "."))
             try:
                 return "\n".join(os.listdir(path))
             except Exception as e:
@@ -703,9 +795,20 @@ class AraAgent:
         return await loop.run_in_executor(None, handler)
 
     async def run(self):
+        # Install our asyncio exception handler so anything that throws
+        # in a coroutine or callback gets logged with a full traceback
+        # instead of just being printed to stderr.
+        try:
+            from ara_agent.log_setup import install_asyncio_hook
+            install_asyncio_hook(asyncio.get_running_loop())
+        except Exception:
+            log.exception("failed to install asyncio exception hook")
+
+        log.info("AraAgent.run() \u2014 connecting to %s", ENDPOINT)
         try:
             await self.connect()
         except Exception as e:
+            log.exception("WebSocket connect failed")
             print(f"\n\u274c Connection failed: {e}")
             print("Common fixes:")
             print("  - Make sure your API key has Voice access in console.x.ai")
