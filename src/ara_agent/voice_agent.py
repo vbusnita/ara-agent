@@ -291,6 +291,26 @@ class AraAgent:
             if not triggered_response and not self._response_active:
                 self._set_state("listening")
 
+    async def cancel_response(self) -> None:
+        """Barge-in: cancel the in-flight server response. Clears the
+        playback buffer too, so the user hears Ara stop immediately
+        rather than draining whatever's already queued."""
+        if self.ws is None:
+            return
+        if not self._response_active:
+            return
+        try:
+            await self.ws.send(json.dumps({"type": "response.cancel"}))
+        except Exception as e:
+            print(f"⚠️  Cancel send failed: {type(e).__name__}: {e}")
+        with self._play_lock:
+            self._play_buffer.clear()
+            self._play_buffer_pos = 0
+            self._buffered_samples = 0
+            self._is_streaming = False
+        self._response_active = False
+        self._set_state("listening")
+
     async def request_screenshot_description(self) -> None:
         """User-triggered alternate to text capture: take the same
         interactive screenshot, but send the image to xAI grok-4.3 for a

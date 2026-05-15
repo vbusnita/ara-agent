@@ -41,7 +41,9 @@ from AppKit import (
 from Foundation import NSObject, NSPoint, NSRect, NSSize, NSTimer
 from PyObjCTools import AppHelper
 
+from ara_agent.hotkeys import GlobalHotkey
 from ara_agent.icons import ensure_icons
+from ara_agent.rotary_hud import RotaryHUD
 from ara_agent.voice_agent import AraAgent
 
 
@@ -129,6 +131,11 @@ class OverlayController(NSObject):
         self._agent_thread: Optional[threading.Thread] = None
         self._agent_loop: Optional[asyncio.AbstractEventLoop] = None
         self._agent: Optional[AraAgent] = None
+        # Set True while a screenshot capture is mid-flight (either OCR
+        # or vision). Prevents hotkey spam from spawning a second
+        # `screencapture -i` (which macOS rejects with "cannot run two
+        # interactive screen captures at a time").
+        self._capture_in_progress = False
 
         # Panel positioned near the top-right of the main screen.
         screen_frame = NSScreen.mainScreen().visibleFrame()
@@ -181,6 +188,18 @@ class OverlayController(NSObject):
             TICK_SECONDS, self, "tick:", None, True
         )
 
+        # Rotary HUD for hotkey-driven action selection.
+        self._rotary = RotaryHUD.alloc().init()
+
+        # Global hotkey: Cmd+Shift+A cycles the rotary HUD. Implemented
+        # via Carbon's RegisterEventHotKey — no macOS permission needed.
+        self._hotkey = GlobalHotkey(on_press=self._on_hotkey)
+        installed = self._hotkey.install()
+        if installed:
+            print("🔑 Hotkey active: ⌘⇧A cycles Start / Stop / Capture options.")
+        else:
+            print("⚠️  Hotkey registration failed — check console for details.")
+
         return self
 
     # ---- main-thread animation ----
@@ -199,9 +218,41 @@ class OverlayController(NSObject):
             self._state = state
             self._frame_idx = 0
 
-    # ---- click → context menu ----
+    # ---- hotkey ----
+
+    def _on_hotkey(self):
+        """Cmd+Shift+A pressed. Cycle the capture actions when the agent
+        is running. When not running, the hotkey is a no-op — Start /
+        Stop Listening are only available via the overlay's click menu,
+        so they can't be triggered by accident from the rotary."""
+        if not (self._agent_thread and self._agent_thread.is_alive()):
+            return
+        if self._capture_in_progress:
+            # A screencapture UI is open or its result is being processed.
+            # Ignore further hotkey presses until it completes.
+            return
+        items = [
+            ("Capture Text",  lambda: self.captureText_(None)),
+            ("Capture Image", lambda: self.captureImage_(None)),
+        ]
+        if self._rotary._panel.isVisible():
+            self._rotary.advance()
+        else:
+            self._rotary.present(items, self._panel)
+
+    # ---- click → context menu, OR cancel if speaking ----
 
     def _handle_click(self, event, view):
+        # Click during Ara's speech = barge-in (cancel current response)
+        # rather than opening the menu. Lets the user interrupt without
+        # navigating menu items.
+        if self._state == "speaking":
+            loop = self._agent_loop
+            agent = self._agent
+            if loop and agent and loop.is_running():
+                asyncio.run_coroutine_threadsafe(agent.cancel_response(), loop)
+            return
+
         menu = NSMenu.alloc().init()
         running = self._agent_thread is not None and self._agent_thread.is_alive()
 
@@ -264,9 +315,13 @@ class OverlayController(NSObject):
         if not (loop and agent and loop.is_running()):
             print("Start listening before capturing.")
             return
-        asyncio.run_coroutine_threadsafe(
+        if self._capture_in_progress:
+            return
+        self._capture_in_progress = True
+        future = asyncio.run_coroutine_threadsafe(
             agent.request_screenshot_context(), loop
         )
+        future.add_done_callback(lambda _f: self._clear_capture_lock())
 
     def captureImage_(self, _sender):
         """Image mode: send the shot to xAI grok-4.3 for a visual
@@ -276,15 +331,30 @@ class OverlayController(NSObject):
         if not (loop and agent and loop.is_running()):
             print("Start listening before capturing.")
             return
-        asyncio.run_coroutine_threadsafe(
+        if self._capture_in_progress:
+            return
+        self._capture_in_progress = True
+        future = asyncio.run_coroutine_threadsafe(
             agent.request_screenshot_description(), loop
         )
+        future.add_done_callback(lambda _f: self._clear_capture_lock())
+
+    def _clear_capture_lock(self):
+        """Called from the asyncio thread when a capture coroutine
+        finishes (successful capture, cancellation, or error). Bool
+        assignment is atomic in CPython so cross-thread set is safe."""
+        self._capture_in_progress = False
 
     def quitApp_(self, _sender):
         self._shutdown_agent()
         if self._timer is not None:
             self._timer.invalidate()
             self._timer = None
+        if self._hotkey is not None:
+            self._hotkey.uninstall()
+            self._hotkey = None
+        if self._rotary is not None:
+            self._rotary.hide()
         NSApp.terminate_(None)
 
     # ---- agent lifecycle (background thread) ----
