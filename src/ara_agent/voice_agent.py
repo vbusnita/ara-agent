@@ -64,6 +64,48 @@ def _normalize_path(p: str) -> str:
     return os.path.expanduser(os.path.expandvars(p))
 
 
+# Ara's system prompt. Kept at module scope so it's easy to find and
+# evolve as her capabilities grow. Key things she needs to know:
+#   1. Her environment (whose Mac, home dir, launch dir)
+#   2. What tools she has
+#   3. How the screen-capture flows work — because they're driven by
+#      the user (not by Ara calling a tool), she needs to recognize
+#      the incoming `[Context — App: …]` packets as captures rather
+#      than treating them as confusing user messages.
+SYSTEM_PROMPT = (
+    "You are Ara, a warm, friendly, and highly competent macOS sysadmin. "
+    "Speak naturally and conversationally. Be helpful and concise.\n\n"
+
+    f"You're running on {USER_NAME}'s Mac. Their home directory is "
+    f"{HOME_DIR}. You were launched from {LAUNCH_CWD}. Use absolute "
+    "paths in tool calls (not '~'). Always warn before running "
+    "potentially destructive commands.\n\n"
+
+    "## Tools\n"
+    "You have function tools to run bash commands, read files, list "
+    "directories, open macOS apps, and run AppleScript. Use them "
+    "freely to accomplish what the user asks. After a tool runs, the "
+    "system automatically asks you to follow up — talk about what you "
+    "found or did, don't just go silent.\n\n"
+
+    "## Screen captures (important — these arrive automatically)\n"
+    "The user has hotkeys and menu items that capture parts of their "
+    "screen and send the content to you DIRECTLY. You never need to "
+    "tell them to save a file, attach an image, paste text, or take a "
+    "screenshot with macOS — the host app handles capture and feeds it "
+    "into this conversation as a regular user message. Two modes:\n"
+    "  • 'Capture Text' (OCR): Apple Vision extracts text locally and "
+    "you receive the literal characters.\n"
+    "  • 'Capture Image' (vision): a vision model briefly describes "
+    "the screenshot and you receive the description.\n"
+    "Both arrive as user messages prefixed with "
+    "`[Context — App: … | Window: … | source: OCR | vision]` and the "
+    "content underneath. When the user says they'll 'show you' or "
+    "'share' something, just wait briefly — the capture is coming. "
+    "Don't give save-as instructions; don't ask them to paste."
+)
+
+
 def _format_tool_call(tool_name: str, args: dict) -> str:
     """Terminal-style representation of a tool call for the HUD.
     bash commands look like `$ cmd`; other tools as `tool args`."""
@@ -330,6 +372,7 @@ class AraAgent:
         and crucially no asyncio-executor GIL contention that used to
         chop audio mid-response.
         """
+        from ara_agent.context import build_capture_packet
         from ara_agent.screenshot import capture_and_extract_text
 
         if self.ws is None:
@@ -348,12 +391,9 @@ class AraAgent:
                 "info",
                 f"OCR  {len(text)} chars / {line_count} lines",
             )
-            framed = (
-                "[The user just captured text from a region of their screen. "
-                "Here is exactly what the screen shows:\n\n"
-                f"{text}\n\n"
-                "Use this as context for what they're asking about.]"
-            )
+            # The packet probes the frontmost app/window so Ara knows
+            # which surface the user is pointing at, not just the bytes.
+            framed = build_capture_packet("ocr_text", text)
             await self.ws.send(json.dumps({
                 "type": "conversation.item.create",
                 "item": {
@@ -404,6 +444,7 @@ class AraAgent:
         what the user is asking about. Slower than OCR and costs tokens,
         so prefer text mode by default.
         """
+        from ara_agent.context import build_capture_packet
         from ara_agent.screenshot import capture_and_describe
 
         if self.ws is None:
@@ -420,10 +461,9 @@ class AraAgent:
             self._emit_event(
                 "info", f"Image  {description[:120]}",
             )
-            framed = (
-                "[The user just shared a screenshot of their screen. "
-                f"Here is what is visible in it: {description}]"
-            )
+            # Same chokepoint as the OCR path — probes app/window so the
+            # description doesn't float context-free.
+            framed = build_capture_packet("vision", description)
             await self.ws.send(json.dumps({
                 "type": "conversation.item.create",
                 "item": {
@@ -450,16 +490,7 @@ class AraAgent:
             "type": "session.update",
             "session": {
                 "voice": VOICE,
-                "instructions": (
-                    "You are Ara, a warm, friendly, and highly competent macOS sysadmin. "
-                    "Speak naturally and conversationally. Be helpful and concise. "
-                    "You can run bash commands, read files, and explore the system. "
-                    f"You're running on {USER_NAME}'s Mac. "
-                    f"Their home directory is {HOME_DIR}. "
-                    f"You were launched from {LAUNCH_CWD}. "
-                    "Use absolute paths in tool calls (not '~'). "
-                    "Always warn before running potentially destructive commands."
-                ),
+                "instructions": SYSTEM_PROMPT,
                 "turn_detection": {"type": "server_vad"},
                 "tools": TOOLS
             }

@@ -103,6 +103,22 @@ def setup_logging() -> None:
     ))
     root.addHandler(console_handler)
 
+    # Silence noisy third-party libraries that log at DEBUG. Without
+    # this, websockets writes every audio chunk frame (~25 KB / second
+    # of mic input) and rotates our actual app events into oblivion.
+    # We still see WARNING+ from these libs — real errors get through.
+    for noisy in (
+        "websockets",
+        "websockets.client",
+        "websockets.server",
+        "websockets.protocol",
+        "urllib3",
+        "PIL",
+        "keyring",
+        "asyncio",  # asyncio.debug-level chatter; we have our own hook
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
     _install_exception_hooks()
 
     logging.getLogger("ara_agent").info(
