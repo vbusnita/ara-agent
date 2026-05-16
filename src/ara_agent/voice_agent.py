@@ -286,6 +286,11 @@ class AraAgent:
         # True between the first audio chunk of a response and response.done.
         # Used by the player to avoid flickering to "listening" between audio chunks.
         self._response_active = False
+        # True from function_call_arguments.done through to the moment we
+        # send response.create for the follow-up. Holds the UI state at
+        # "thinking" so it doesn't briefly flip to "listening" between the
+        # server's initial response.done and the follow-up audio arriving.
+        self._in_tool_flow = False
 
     def _set_state(self, state: str) -> None:
         try:
@@ -587,8 +592,17 @@ class AraAgent:
                     if empty_since is None:
                         empty_since = loop.time()
                     elapsed = loop.time() - empty_since
-                    response_truly_done = not self._response_active
-                    grace_fired = elapsed > EMPTY_GRACE_SECONDS
+                    # _in_tool_flow holds state at "thinking" through the
+                    # tool execution + follow-up trigger. Don't transition
+                    # to listening while that's set, regardless of how
+                    # long the buffer's been empty.
+                    response_truly_done = (
+                        not self._response_active and not self._in_tool_flow
+                    )
+                    grace_fired = (
+                        elapsed > EMPTY_GRACE_SECONDS
+                        and not self._in_tool_flow
+                    )
 
                     if response_truly_done or grace_fired:
                         # Report whether this response had buffer-starvation
@@ -683,29 +697,62 @@ class AraAgent:
                 if self._resp_stats:
                     self._resp_stats["had_tool_call"] = True
                 self._set_state("thinking")
+                # Hold state at "thinking" through the whole tool dance —
+                # see __init__ comment on _in_tool_flow for why.
+                self._in_tool_flow = True
 
                 try:
-                    result = await self.execute_tool(tool_name, args)
-                except Exception as e:
-                    log.exception("tool %r raised", tool_name)
-                    result = f"Error: {type(e).__name__}: {e}"
-                log.info("tool result (%s): %d chars", tool_name, len(result))
-                # Full result text goes to the HUD; the HUD truncates for
-                # display but stores everything in its scrollable log.
-                self._emit_event("result", _clean_tool_result(result))
+                    try:
+                        result = await self.execute_tool(tool_name, args)
+                    except Exception as e:
+                        log.exception("tool %r raised", tool_name)
+                        result = f"Error: {type(e).__name__}: {e}"
+                    log.info("tool result (%s): %d chars", tool_name, len(result))
+                    # Full result text goes to the HUD; the HUD truncates
+                    # for display but stores everything in its scrollable
+                    # log.
+                    self._emit_event("result", _clean_tool_result(result))
 
-                await self.ws.send(json.dumps({
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "function_call_output",
-                        "call_id": data["call_id"],
-                        "output": result
-                    }
-                }))
+                    await self.ws.send(json.dumps({
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "function_call_output",
+                            "call_id": data["call_id"],
+                            "output": result
+                        }
+                    }))
+                    # Tool output alone doesn't generate a new turn — the
+                    # realtime API requires an explicit response.create
+                    # to make the model speak about what the tool
+                    # returned. Without this, Ara goes silent after the
+                    # command runs.
+                    await self.ws.send(json.dumps({
+                        "type": "response.create",
+                    }))
+                    log.info(
+                        "submitted tool output + response.create for %s",
+                        tool_name,
+                    )
+                    # Mark active so the player's watcher doesn't briefly
+                    # transition to "listening" before the follow-up's
+                    # first audio chunk lands.
+                    self._response_active = True
+                finally:
+                    # Always clear the tool-flow flag so response.done for
+                    # the follow-up actually transitions us to listening.
+                    self._in_tool_flow = False
 
             elif msg_type == "response.done":
-                # State transitions through the HUD now; no need to print.
-                self._response_active = False
+                # If we're mid tool-flow, the server's response.done is
+                # only marking the END of the pre-tool half of the turn.
+                # Don't flip _response_active off yet — the follow-up
+                # response will arrive after our response.create, and we
+                # want the watcher to stay in "thinking" through the gap.
+                if not self._in_tool_flow:
+                    self._response_active = False
+                log.debug(
+                    "response.done (in_tool_flow=%s)", self._in_tool_flow,
+                )
                 stats = self._resp_stats
                 if stats and stats.get("first_audio"):
                     wall_ms = (loop.time() - stats["start"]) * 1000
