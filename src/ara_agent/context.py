@@ -95,36 +95,37 @@ def probe_active_window(timeout: float = 4.0) -> ActiveContext:
     return ActiveContext()
 
 
-# Packet templates — change them here to evolve how context is framed
-# for the model without touching call sites. Each template gets two
-# substitutions: {ctx} (the ActiveContext.short() summary) and
-# {content} (the actual captured text or vision description).
+# Packet template for vision captures. Single source of truth for how
+# screen context is framed for the model — change it here, not at call
+# sites. Substitutions: {ctx} (ActiveContext.short()) and {content}
+# (the vision model's 1-sentence description).
+#
+# We used to support a second "ocr_text" template that injected raw
+# Apple-OCR'd screen text directly into the realtime conversation. That
+# path was deleted after every OCR-injection turn in three live tests
+# stalled xAI's grok-voice-latest backend (Stream idle timeout / gRPC
+# UNAVAILABLE) while every vision turn succeeded. Voice models want
+# semantic context, not raw bytes.
 
-_PACKET_TEMPLATES = {
-    "ocr_text": (
-        "[Context — {ctx} | source: OCR]\n"
-        "Here is the literal text visible on the user's screen "
-        "right now. Use it to answer their question or react to what "
-        "they're looking at:\n\n"
-        "{content}"
-    ),
-    "vision": (
-        "[Context — {ctx} | source: vision]\n"
-        "Here is a brief description of what the user is looking at "
-        "on their screen:\n\n"
-        "{content}"
-    ),
-}
+_VISION_TEMPLATE = (
+    "[Context — {ctx} | source: vision]\n"
+    "Here is a brief description of what the user is looking at "
+    "on their screen:\n\n"
+    "{content}"
+)
 
 
 def build_capture_packet(kind: str, content: str) -> str:
-    """Wrap a capture into a single block of text ready to inject into
-    the realtime conversation. Includes app/window metadata and a
+    """Wrap a vision capture into a single block of text ready to inject
+    into the realtime conversation. Includes app/window metadata and a
     timestamp so the model can reason about which surface the user is
-    pointing at (and disambiguate from earlier captures)."""
+    pointing at (and disambiguate from earlier captures).
+
+    `kind` is kept for forward compatibility (future packet types) but
+    currently only "vision" is meaningful — other kinds use the same
+    template."""
     ctx = probe_active_window()
-    template = _PACKET_TEMPLATES.get(kind, _PACKET_TEMPLATES["ocr_text"])
-    packet = template.format(ctx=ctx.short(), content=content)
+    packet = _VISION_TEMPLATE.format(ctx=ctx.short(), content=content)
     log.info(
         "context packet: kind=%s, app=%r, window=%r, content_len=%d",
         kind, ctx.app, ctx.window, len(content),

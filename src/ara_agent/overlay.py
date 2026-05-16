@@ -204,7 +204,7 @@ class OverlayController(NSObject):
         self._hotkey = GlobalHotkey(on_press=self._on_hotkey)
         installed = self._hotkey.install()
         if installed:
-            print("🔑 Hotkey active: ⌘⇧A cycles Start / Stop / Capture options.")
+            print("🔑 Hotkey active: ⌘⇧A triggers Capture when listening.")
         else:
             print("⚠️  Hotkey registration failed — check console for details.")
 
@@ -237,10 +237,15 @@ class OverlayController(NSObject):
     # ---- hotkey ----
 
     def _on_hotkey(self):
-        """Cmd+Shift+A pressed. Cycle the capture actions when the agent
+        """Cmd+Shift+A pressed. Trigger a vision capture when the agent
         is running. When not running, the hotkey is a no-op — Start /
         Stop Listening are only available via the overlay's click menu,
-        so they can't be triggered by accident from the rotary."""
+        so they can't be triggered by accident from the rotary.
+
+        Only one capture mode now (vision); the old Capture Text / Image
+        rotary was collapsed after the OCR-injection path was removed.
+        We still route through the rotary to keep the visual feedback
+        and the dismiss-on-second-press affordance."""
         if not (self._agent_thread and self._agent_thread.is_alive()):
             return
         if self._capture_in_progress:
@@ -248,8 +253,7 @@ class OverlayController(NSObject):
             # Ignore further hotkey presses until it completes.
             return
         items = [
-            ("Capture Text",  lambda: self.captureText_(None)),
-            ("Capture Image", lambda: self.captureImage_(None)),
+            ("Capture", lambda: self.capture_(None)),
         ]
         if self._rotary._panel.isVisible():
             self._rotary.advance()
@@ -279,17 +283,11 @@ class OverlayController(NSObject):
             start.setTarget_(self)
             menu.addItem_(start)
         else:
-            text_shot = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Capture Text…", "captureText:", ""
+            shot = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Capture…", "capture:", ""
             )
-            text_shot.setTarget_(self)
-            menu.addItem_(text_shot)
-
-            img_shot = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Capture Image…", "captureImage:", ""
-            )
-            img_shot.setTarget_(self)
-            menu.addItem_(img_shot)
+            shot.setTarget_(self)
+            menu.addItem_(shot)
 
             menu.addItem_(NSMenuItem.separatorItem())
 
@@ -325,25 +323,15 @@ class OverlayController(NSObject):
     def stopAgent_(self, _sender):
         self._shutdown_agent()
 
-    def captureText_(self, _sender):
-        """OCR mode: local Apple Vision text recognition. Fast, no API
-        call, no token cost. Best for code, errors, prose."""
-        loop = self._agent_loop
-        agent = self._agent
-        if not (loop and agent and loop.is_running()):
-            print("Start listening before capturing.")
-            return
-        if self._capture_in_progress:
-            return
-        self._capture_in_progress = True
-        future = asyncio.run_coroutine_threadsafe(
-            agent.request_screenshot_context(), loop
-        )
-        future.add_done_callback(lambda _f: self._clear_capture_lock())
+    def capture_(self, _sender):
+        """Single capture path: take a screenshot and send it to xAI's
+        vision model for a one-sentence semantic description, which is
+        then injected into the realtime conversation as context.
 
-    def captureImage_(self, _sender):
-        """Image mode: send the shot to xAI grok-4.3 for a visual
-        description. Slower, costs tokens — use when graphics matter."""
+        This replaced two earlier modes (Apple-OCR text and grok vision).
+        The OCR-text path was deleted after consistently stalling xAI's
+        Realtime backend on text-input turns. For literal text reading,
+        the model uses the read_screen_region_text tool instead."""
         loop = self._agent_loop
         agent = self._agent
         if not (loop and agent and loop.is_running()):

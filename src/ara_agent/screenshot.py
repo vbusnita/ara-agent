@@ -1,18 +1,23 @@
-"""Take a screenshot and either OCR it locally OR send it to xAI's
-vision model for a visual description. Two complementary modes:
+"""Screen-perception flows for ara-agent. Two entry points share the
+same interactive `screencapture -i` step:
 
-  • "Capture Text" — local OCR via Apple Vision. ~100 ms, no API call,
-    zero token cost, no audio-thread GIL contention. Ara receives the
-    literal characters on screen. Best for code, errors, docs, anything
-    text-heavy where the user wants Ara to read exact content.
+  • capture_and_describe() — Pillow-shrunk JPEG → xAI grok-4.3 vision.
+    Returns a one-sentence semantic description suitable for injecting
+    as conversation context. The default capture path triggered by the
+    overlay's Capture menu / hotkey.
 
-  • "Capture Image" — Pillow-shrunk JPEG sent to xAI grok-4.3 via the
-    Responses API. ~2-3 s, costs tokens, briefly contends GIL during
-    base64+JSON. Ara receives a 2–3 sentence description. Best for
-    charts, diagrams, UI layouts, anything where visuals matter.
+  • capture_and_clean_for_reading() — Apple Vision OCR (local, exact
+    transcription via `ocr_sync`) → xAI grok-4.3 chat (strips code,
+    URLs, chrome, timestamps, etc.). Returns prose-only text suitable
+    for reading aloud. Invoked by the read_screen_region_text tool
+    when the user asks the agent to read a wall of text.
 
-The capture step (`screencapture -i`) is shared — user can drag a
-region OR press Space to switch to window-pick mode, ESC to cancel.
+Apple OCR has one job here: faithfully transcribe pixels into the
+exact text on screen, which the cleaner then judges for "readability."
+Vision models would paraphrase that first step — wrong tool for it.
+
+The capture step is interactive: drag to select a region, Space to
+toggle window-pick mode, ESC to cancel.
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 from PIL import Image
 
@@ -100,26 +105,6 @@ def ocr_sync(path: Path) -> str:
         if candidates and len(candidates) > 0:
             lines.append(candidates[0].string())
     return "\n".join(lines)
-
-
-async def capture_and_extract_text() -> Optional[str]:
-    """Capture → OCR locally → return text. None if cancelled or no text."""
-    loop = asyncio.get_running_loop()
-    path = await loop.run_in_executor(None, capture_screen)
-    if path is None:
-        return None
-    try:
-        text = await loop.run_in_executor(None, ocr_sync, path)
-    except Exception as e:
-        print(f"⚠️  OCR failed: {type(e).__name__}: {e}")
-        return None
-    finally:
-        try:
-            path.unlink(missing_ok=True)
-        except Exception:
-            pass
-    text = text.strip() if text else ""
-    return text if text else None
 
 
 # ----- image mode: xAI grok-4.3 via Responses API -----
@@ -212,8 +197,17 @@ def describe_image_sync(path: Path, api_key: str) -> str:
     return text
 
 
-async def capture_and_describe(api_key: str) -> Optional[str]:
-    """Capture → vision-describe → return description. None if cancelled."""
+async def capture_and_describe(
+    api_key: str,
+) -> Optional[Tuple[str, Path]]:
+    """Capture → vision-describe → return (description, screenshot_path).
+    None if cancelled or describe failed.
+
+    The path is RETURNED to the caller rather than deleted here so the
+    read_screen_region_text tool can reuse the same screenshot for OCR
+    without forcing the user to drag-select the same region twice. The
+    caller is responsible for unlinking it (AraAgent owns the lifecycle
+    via self._last_capture_path)."""
     loop = asyncio.get_running_loop()
     path = await loop.run_in_executor(None, capture_screen)
     if path is None:
@@ -230,13 +224,154 @@ async def capture_and_describe(api_key: str) -> Optional[str]:
             pass
         print(f"⚠️  Vision API error: {e.code} {e.reason}"
               + (f" — {body}" if body else ""))
-        return None
-    except Exception as e:
-        print(f"⚠️  Vision call failed: {type(e).__name__}: {e}")
-        return None
-    finally:
+        # Failure → caller won't get a path to cache, so clean up here.
         try:
             path.unlink(missing_ok=True)
         except Exception:
             pass
-    return description
+        return None
+    except Exception as e:
+        print(f"⚠️  Vision call failed: {type(e).__name__}: {e}")
+        try:
+            path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+    return description, path
+
+
+# ----- read-aloud mode: Apple OCR + grok-4.3 prose cleaning -----
+#
+# Apple OCR gives us exact transcription (its strength); grok-4.3 gives
+# us "what's worth speaking aloud" judgment (its strength). Compose the
+# two: OCR for fidelity, model for taste.
+
+READING_MODEL = "grok-4.3"
+READING_ENDPOINT = "https://api.x.ai/v1/responses"
+
+# Sentinel the cleaner returns when nothing on screen is worth reading
+# (pure code, all chrome, etc.). Tool layer translates it to a friendly
+# user message instead of having the voice agent say literal junk.
+NO_PROSE_SENTINEL = "NO_PROSE_FOUND"
+
+READING_PROMPT = (
+    "You are preparing text that will be spoken aloud to a user by a "
+    "voice assistant. Below is text OCR'd from the user's screen. "
+    "Return ONLY the natural-language prose that should be read aloud "
+    "— strip everything else.\n\n"
+    "STRIP OUT:\n"
+    "- Source code, code snippets, syntax markers (braces, semicolons, "
+    "type annotations, imports, function signatures)\n"
+    "- URLs, file paths, shell commands, terminal output\n"
+    "- Navigation chrome: isolated menu items, button labels, tab "
+    "labels, breadcrumbs, side-nav links\n"
+    "- Timestamps, log lines, structured numeric data, tables\n"
+    "- Cookie notices, ad placeholders, copyright footers, version "
+    "numbers, share-button labels\n"
+    "- Repeated separators or garbled OCR fragments\n\n"
+    "KEEP:\n"
+    "- Article body, email body, message text, document prose\n"
+    "- Headings that flow into the prose\n"
+    "- Bullet points that are full sentences\n"
+    "- Direct quotes\n\n"
+    "FORMAT:\n"
+    "Return only the cleaned text exactly as it should be spoken. No "
+    "preamble like \"Here is the text:\". No commentary. Punctuation "
+    "should support natural speech rhythm. If the screen contains no "
+    f"meaningful prose worth reading aloud, return exactly: {NO_PROSE_SENTINEL}\n\n"
+    "OCR'd text:\n---\n"
+)
+
+
+def clean_ocr_for_reading_sync(ocr_text: str, api_key: str) -> str:
+    """Send OCR text to grok-4.3 with the reading prompt, return the
+    model's cleaned output. Raises on transport/API failure."""
+    body = json.dumps({
+        "model": READING_MODEL,
+        "input": [{
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": READING_PROMPT + ocr_text + "\n---\n",
+            }],
+        }],
+    }).encode()
+    req = urllib.request.Request(
+        READING_ENDPOINT,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        data = json.load(resp)
+    text = _extract_text(data)
+    if not text:
+        raise RuntimeError(f"Empty reading-cleaner response: {data}")
+    return text
+
+
+async def capture_and_clean_for_reading(
+    api_key: str,
+    existing_path: Optional[Path] = None,
+) -> Optional[str]:
+    """Apple OCR → grok-4.3 cleaning → return prose-only text.
+
+    If `existing_path` is provided (and the file still exists on disk),
+    OCR runs against that screenshot instead of prompting the user to
+    drag-select a new region. This is the cached-last-capture path: the
+    user hits ⌘⇧A once, then asks Ara to read — same screenshot is
+    reused, no second selection required. If the cached file is missing
+    or no path was passed, falls back to a fresh interactive capture.
+
+    Returns None on user-cancel, empty OCR, or API failure. Returns the
+    literal NO_PROSE_SENTINEL string when the screen has no speakable
+    prose — caller should turn that into a user-facing message rather
+    than reading the sentinel aloud."""
+    loop = asyncio.get_running_loop()
+
+    using_cached = (
+        existing_path is not None and existing_path.exists()
+    )
+    if using_cached:
+        path = existing_path
+    else:
+        path = await loop.run_in_executor(None, capture_screen)
+        if path is None:
+            return None
+    try:
+        raw_text = await loop.run_in_executor(None, ocr_sync, path)
+    except Exception as e:
+        print(f"⚠️  OCR failed: {type(e).__name__}: {e}")
+        return None
+    finally:
+        # Only clean up screenshots WE took. The cached path is owned
+        # by AraAgent and will be cleaned up when the next capture
+        # replaces it (or on agent shutdown).
+        if not using_cached:
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    raw_text = (raw_text or "").strip()
+    if not raw_text:
+        return None
+    try:
+        cleaned = await loop.run_in_executor(
+            None, clean_ocr_for_reading_sync, raw_text, api_key,
+        )
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode(errors="replace")[:500]
+        except Exception:
+            pass
+        print(f"⚠️  Reading cleaner API error: {e.code} {e.reason}"
+              + (f" — {body}" if body else ""))
+        return None
+    except Exception as e:
+        print(f"⚠️  Reading cleaner failed: {type(e).__name__}: {e}")
+        return None
+    cleaned = cleaned.strip()
+    return cleaned if cleaned else None
