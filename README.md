@@ -6,6 +6,12 @@ Ara is a floating "blackhole" overlay that listens, watches your screen when you
 
 The primary interface is a small, always-available, draggable blackhole icon. Click it for actions, use the global hotkey (`Cmd+Shift+A`) to capture context, and talk naturally. There's also an optional inspection HUD for seeing what she's thinking and doing.
 
+## Project Direction
+
+The living source of truth for ara-agent is **[AGENT.md](AGENT.md)**. It describes the current state, vision, known gaps, and priorities.
+
+We're actively moving toward a "supervisor-mode" agent — one that can do real operational grunt work (network mapping, security hardening, etc.) while remaining visible and under your control.
+
 ## Quick Start
 
 ```bash
@@ -49,11 +55,9 @@ We're currently focused on the overlay experience as the main way to use Ara.
 
 ## Development
 
-The source of truth for the project is **[AGENT.md](AGENT.md)** — it contains the current state, vision, known gaps, and priorities.
+**[AGENT.md](AGENT.md)** is the single source of truth for the project's state and direction.
 
-If you're an AI agent working on this codebase, you should also read **CLAUDE.md** (it contains the operating manual and collaboration rules for this project).
-
-We're currently on the `supervisor-mode` branch working toward making Ara a visible, reliable "grunt worker" you can supervise while it does network mapping, security hardening, and other real operational work.
+If you are an AI agent working in this codebase, also read **CLAUDE.md** — it contains the operating manual and collaboration guidelines used on this project.
 
 ## Philosophy
 
