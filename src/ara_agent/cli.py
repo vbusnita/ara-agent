@@ -4,6 +4,11 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
+# Logging must be configured BEFORE any other ara_agent module imports.
+# That way module-level loggers attach to a fully-configured root.
+from ara_agent.log_setup import setup_logging
+setup_logging()
+
 from ara_agent.voice_agent import main as voice_main
 
 app = typer.Typer(help="ara — Voice-first Grok computer agent")
