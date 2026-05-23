@@ -41,7 +41,7 @@ from AppKit import (
     NSWindowStyleMaskBorderless,
     NSWindowStyleMaskNonactivatingPanel,
 )
-from Foundation import NSObject, NSPoint, NSRect, NSSize, NSTimer
+from Foundation import NSObject, NSPoint, NSRect, NSSize, NSTimer, NSUserDefaults
 from PyObjCTools import AppHelper
 
 from ara_agent.hotkeys import GlobalHotkey
@@ -56,6 +56,9 @@ OVERLAY_MARGIN = 10      # padding around the icon in the window
 WINDOW_SIZE = OVERLAY_PT + 2 * OVERLAY_MARGIN
 TICK_SECONDS = 0.06      # ~16 fps animation
 DRAG_THRESHOLD_PX_SQ = 9 # 3 px squared; minimum movement to count as drag
+
+# Persistence for the primary floating surface (blackhole overlay)
+OVERLAY_FRAME_KEY = "ara.overlayLastFrame"  # "x,y,width,height"
 
 
 class IconView(NSImageView):
@@ -169,6 +172,17 @@ class OverlayController(NSObject):
         except Exception:
             pass
 
+        # Persist the user's chosen location for the blackhole across restarts.
+        # This is the primary surface — it should remember which screen the
+        # user placed it on (especially important with a 30" display + laptop).
+        self._load_and_apply_overlay_frame()
+
+        from Foundation import NSNotificationCenter
+        nc = NSNotificationCenter.defaultCenter()
+        nc.addObserver_selector_name_object_(
+            self, "overlayFrameChanged:", "NSWindowDidMoveNotification", self._panel
+        )
+
         # Icon view
         icon_view = IconView.alloc().initWithFrame_(
             NSRect(NSPoint(OVERLAY_MARGIN, OVERLAY_MARGIN),
@@ -195,9 +209,27 @@ class OverlayController(NSObject):
         # Rotary HUD for hotkey-driven action selection.
         self._rotary = RotaryHUD.alloc().init()
 
-        # Output HUD — persistent activity panel at bottom-middle of the
-        # overlay's screen. Auto-shows on listening, hides on stop.
+        # Output HUD — opt-in inspection panel. Built up front but kept
+        # hidden by default; user toggles it from the overlay menu. The
+        # canonical surface is the blackhole overlay itself; the HUD is
+        # a diagnostic / event-log window for when the user wants to see
+        # what the agent is doing.
         self._output_hud = OutputHUD.alloc().initWithAnchor_(self._panel)
+
+        # Restore HUD visibility preference (persists across app launches).
+        # The HUD is an opt-in inspection panel; blackhole is the default surface.
+        defaults = NSUserDefaults.standardUserDefaults()
+        saved = defaults.objectForKey_("ara.hudVisible")
+        self._hud_visible = bool(saved) if saved is not None else False
+
+        # If the user left the Inspection HUD visible on the previous run,
+        # bring it back shortly after launch (after screens + windows are stable).
+        # This makes "I placed my tools where I want them" actually stick on
+        # multi-monitor setups.
+        if self._hud_visible and self._output_hud is not None:
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                0.5, self, "showPersistedHUD:", None, False
+            )
 
         # Global hotkey: Cmd+Shift+A cycles the rotary HUD. Implemented
         # via Carbon's RegisterEventHotKey — no macOS permission needed.
@@ -299,6 +331,20 @@ class OverlayController(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
+        # HUD toggle: title flips based on current visibility so the
+        # menu always reads as the action it'll perform if clicked.
+        hud_title = (
+            "Hide Inspection HUD" if self._hud_visible
+            else "Show Inspection HUD"
+        )
+        hud_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            hud_title, "toggleHUD:", ""
+        )
+        hud_item.setTarget_(self)
+        menu.addItem_(hud_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
         quit_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit Ara", "quitApp:", ""
         )
@@ -313,12 +359,34 @@ class OverlayController(NSObject):
         if self._agent_thread and self._agent_thread.is_alive():
             return
         self._on_agent_state("listening")
-        if self._output_hud is not None:
+        # Only show the HUD if the user has previously opted in via the
+        # menu — default is hidden, the blackhole overlay is enough.
+        if self._hud_visible and self._output_hud is not None:
             self._output_hud.show()
         self._agent_thread = threading.Thread(
             target=self._run_agent, daemon=True
         )
         self._agent_thread.start()
+
+    def toggleHUD_(self, _sender):
+        """Flip the inspection HUD between shown and hidden.
+        The choice is persisted via NSUserDefaults so it survives restarts."""
+        if self._output_hud is None:
+            return
+        self._hud_visible = not self._hud_visible
+        defaults = NSUserDefaults.standardUserDefaults()
+        defaults.setBool_forKey_(self._hud_visible, "ara.hudVisible")
+        if self._hud_visible:
+            self._output_hud.show()
+        else:
+            self._output_hud.hide()
+
+    def showPersistedHUD_(self, _timer):
+        """Called via delayed NSTimer on launch when the user had left the
+        HUD visible. Brings the inspection panel back without requiring
+        the user to manually start the agent."""
+        if self._hud_visible and self._output_hud is not None:
+            self._output_hud.show()
 
     def stopAgent_(self, _sender):
         self._shutdown_agent()
@@ -394,8 +462,55 @@ class OverlayController(NSObject):
         if loop and agent and loop.is_running():
             asyncio.run_coroutine_threadsafe(agent.stop(), loop)
         self._on_agent_state("idle")
-        if self._output_hud is not None:
-            self._output_hud.hide()
+        # Don't auto-hide the HUD on agent stop — if the user opted in,
+        # let them keep inspecting the just-finished session's events.
+        # They can toggle it off from the menu when they're done.
+
+    # ---- overlay position persistence (for multi-monitor stability) ----
+
+    @objc.python_method
+    def _load_and_apply_overlay_frame(self):
+        """Restore the blackhole to the user's last position if we have one
+        and it is still on a valid screen."""
+        from Foundation import NSUserDefaults
+        defaults = NSUserDefaults.standardUserDefaults()
+        frame_str = defaults.stringForKey_(OVERLAY_FRAME_KEY)
+        if not frame_str:
+            return
+        try:
+            x, y, w, h = [float(p) for p in frame_str.split(",")]
+            candidate = NSRect(NSPoint(x, y), NSSize(w, h))
+            if self._overlay_frame_is_usable(candidate):
+                self._panel.setFrame_display_(candidate, False)
+        except Exception:
+            log.exception("failed to restore overlay position")
+
+    @objc.python_method
+    def _overlay_frame_is_usable(self, frame) -> bool:
+        from Foundation import NSPointInRect
+        for screen in NSScreen.screens():
+            vf = screen.visibleFrame()
+            if (frame.origin.x < vf.origin.x + vf.size.width and
+                    frame.origin.x + frame.size.width > vf.origin.x and
+                    frame.origin.y < vf.origin.y + vf.size.height and
+                    frame.origin.y + frame.size.height > vf.origin.y):
+                return True
+        return False
+
+    def overlayFrameChanged_(self, _note):
+        """Save the new position whenever the user drags the blackhole."""
+        self._save_overlay_frame()
+
+    @objc.python_method
+    def _save_overlay_frame(self):
+        try:
+            f = self._panel.frame()
+            s = f"{f.origin.x},{f.origin.y},{f.size.width},{f.size.height}"
+            from Foundation import NSUserDefaults
+            defaults = NSUserDefaults.standardUserDefaults()
+            defaults.setObject_forKey_(s, OVERLAY_FRAME_KEY)
+        except Exception:
+            log.exception("failed to save overlay position")
 
 
 def run_overlay():
