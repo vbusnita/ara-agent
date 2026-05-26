@@ -337,6 +337,22 @@ class OutputHUD(NSObject):
         )
         content_view.addSubview_(self._status_label)
 
+        # Layer 3a.5 (front): small persistent cost line for the dedicated
+        # session cost / token usage panel. Updated live when the voice
+        # agent reports usage from the xAI Realtime server.
+        cost_height = 18
+        cost_y = status_y - cost_height - 2
+        self._cost_label = _PassThroughLabel.alloc().initWithFrame_(
+            NSRect(NSPoint(12, cost_y), NSSize(WIDTH - 24, cost_height))
+        )
+        self._configure_label(self._cost_label, NSTextAlignmentLeft)
+        self._cost_label.setFont_(_monospace_font(NSFontWeightRegular))
+        self._cost_label.setStringValue_("Session cost: —")
+        self._cost_label.setAutoresizingMask_(
+            NSViewMinYMargin | NSViewWidthSizable
+        )
+        content_view.addSubview_(self._cost_label)
+
         # Layer 3b (front): scrollable terminal-style log. NSScrollView
         # wraps an NSTextView so the user can drag-scroll long output,
         # select & copy text, and we auto-scroll to the bottom on each
@@ -344,10 +360,15 @@ class OutputHUD(NSObject):
         # window via the autoresizing mask set further down.
         events_top_pad = 4
         events_bottom_pad = 6
-        events_height = max(0, HEIGHT - status_height - 4
+        # Account for status + cost line
+        cost_line_height = 18
+        events_height = max(0, HEIGHT - status_height - cost_line_height - 6
                             - events_top_pad - events_bottom_pad)
+        # Place the log below the cost line
+        cost_line_height = 18
+        events_y = events_bottom_pad + cost_line_height + 2
         events_frame = NSRect(
-            NSPoint(12, events_bottom_pad),
+            NSPoint(12, events_y),
             NSSize(WIDTH - 24, events_height),
         )
 
@@ -480,6 +501,12 @@ class OutputHUD(NSObject):
                 attr = _info_string(line)
             elif kind == "warn":
                 line = f"⚠ {text}\n"
+                attr = _info_string(line)
+            elif kind == "cost":
+                # Dedicated live cost line — update the persistent label
+                # and still append to the log for history.
+                self._cost_label.setStringValue_(text)
+                line = f"💰 {text}\n"
                 attr = _info_string(line)
             else:
                 line = f"{text}\n"

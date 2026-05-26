@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -230,94 +231,16 @@ def _pick_input_device() -> Optional[int]:
 
     return non_bt[0][0] if non_bt else None
 
-TOOLS = [
-    {
-        "type": "function",
-        "name": "run_bash",
-        "description": "Execute a bash command on the local machine (use with caution).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string"},
-                "reason": {"type": "string"}
-            },
-            "required": ["command"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "read_file",
-        "description": "Read the contents of a file.",
-        "parameters": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "list_files",
-        "description": "List files and directories.",
-        "parameters": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}}
-        }
-    },
-    {
-        "type": "function",
-        "name": "open_app",
-        "description": "Open a macOS application by name (e.g. 'Safari', 'Notes', 'Terminal', 'Music').",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "app_name": {
-                    "type": "string",
-                    "description": "The name of the application to open, as it appears in /Applications."
-                }
-            },
-            "required": ["app_name"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "run_applescript",
-        "description": (
-            "Execute arbitrary AppleScript on the local macOS machine. "
-            "Powerful — can control any scriptable app, system settings, files, and UI. "
-            "Use for anything beyond simple app launching."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "script": {
-                    "type": "string",
-                    "description": "The AppleScript source to run (will be passed to osascript -e)."
-                }
-            },
-            "required": ["script"]
-        }
-    },
-    {
-        "type": "function",
-        "name": "read_screen_region_text",
-        "description": (
-            "Read text from the user's screen aloud. Use this ONLY when the user "
-            "explicitly asks you to read something to them — e.g. 'read this article "
-            "to me', 'read this email out loud', 'read me what's on screen'. The user "
-            "will be prompted to drag-select the region they want read. The tool "
-            "returns the prose-only text (source code, URLs, file paths, navigation "
-            "chrome, timestamps, and other non-readable elements are stripped before "
-            "you see them). After calling, speak the returned text naturally and "
-            "verbatim — do not paraphrase, summarize, or add commentary unless the "
-            "user asks you to. If the tool returns a message about no prose being "
-            "found, tell the user and offer to describe what's on screen instead."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {},
-        }
-    }
-]
+# Tools are now defined in ara_agent/tools/definitions.py for sharing with the Brain layer.
+# We still import here for backward compatibility during the transition.
+from ara_agent.tools.definitions import TOOLS as _SHARED_TOOLS
+TOOLS = _SHARED_TOOLS
+
+# Lazy import to avoid circular dependency during the architecture transition
+try:
+    from ara_agent.brain import Brain
+except Exception:
+    Brain = None  # type: ignore
 
 
 class AraAgent:
@@ -325,6 +248,9 @@ class AraAgent:
         self,
         state_callback: Optional[Callable[[str], None]] = None,
         event_callback: Optional[Callable[[str, str], None]] = None,
+        cost_callback: Optional[Callable[[dict], None]] = None,
+        brain: Optional["Brain"] = None,
+        run_id: Optional[str] = None,
     ):
         self.ws = None
         self.is_running = False
@@ -349,6 +275,16 @@ class AraAgent:
         self._underrun_frames: int = 0
         # Per-response telemetry — reset on response.created.
         self._resp_stats: dict = {}
+
+        # Session-level token / cost tracking for the dedicated cost HUD panel.
+        # These are accumulated from server usage reports (ground truth for
+        # what this WS session consumed). Reset on new connection.
+        self._session_input_tokens: int = 0
+        self._session_output_tokens: int = 0
+        self._session_total_tokens: int = 0
+        self._last_usage: Optional[dict] = None  # most recent usage blob from server
+        self._recent_vision_packet: bool = False
+
         # Called whenever the agent transitions states (idle/listening/thinking/speaking).
         # Invoked on the asyncio thread, so the listener must marshal back to main if needed.
         self._state_callback = state_callback or (lambda _state: None)
@@ -357,6 +293,11 @@ class AraAgent:
         # "call" / "result" / "say" / "info" / "warn". Same threading
         # caveat as state_callback.
         self._event_callback = event_callback or (lambda _k, _t: None)
+        # Dedicated cost callback: receives the raw usage dict from the server.
+        # The CostHUD subscribes to this so it can do proper session/lifetime math.
+        self._cost_callback = cost_callback
+        self.brain = brain
+        self._run_id = run_id or "n/a"
         # True between the first audio chunk of a response and response.done.
         # Used by the player to avoid flickering to "listening" between audio chunks.
         self._response_active = False
@@ -386,15 +327,39 @@ class AraAgent:
         # in one breath. Cleaned up when a new capture replaces it or
         # on agent close.
         self._last_capture_path: Optional[Path] = None
-        # Auto-retry state for capture-induced turns. When the watchdog
-        # cancels a response that was waiting on a capture packet, we
-        # quietly resend response.create up to MAX_CAPTURE_RETRIES times
-        # before giving up. xAI's voice backend has been flaky on text-
-        # injection turns (stalls/idle-timeouts) and retries cover most
-        # transient failures without the user noticing.
+        # Auto-retry state for *programmatic* response turns we care
+        # about: capture-induced turns (vision packet → speak) and
+        # tool-follow-up turns (tool result → speak). When the watchdog
+        # cancels one of these, we quietly resend response.create up
+        # to MAX_RESPONSE_RETRIES additional times before giving up.
+        # xAI's voice backend has been flaky on text-injection turns
+        # (stalls/idle-timeouts) and retries cover most transient
+        # failures without the user noticing.
+        #
+        # Not armed for user-voice turns — if the user spoke and the
+        # response stalls, they're right there and can just speak again,
+        # and the user-cancellation flow already handles barge-in.
         # Shape when set: {"attempts": int, "max_attempts": int}
-        self._pending_capture_retry: Optional[dict] = None
-        self.MAX_CAPTURE_RETRIES = 2  # → 3 attempts total
+        self._pending_response_retry: Optional[dict] = None
+        self.MAX_RESPONSE_RETRIES = 2  # → 3 attempts total
+
+        # xAI service-health tracking. We've stacked four layers of
+        # client-side resilience around xAI's Realtime backend; further
+        # workarounds have diminishing returns. Instead we just OBSERVE
+        # the failure rate and tell the user when the service is
+        # degraded enough that retries probably won't save them — they
+        # can make their own call to pause or keep trying.
+        #
+        # _health_events holds timestamps of recent xAI failures
+        # (watchdog fires + server error events) within HEALTH_WINDOW_S.
+        # When count ≥ HEALTH_DEGRADED_THRESHOLD we flip into degraded
+        # state and emit a one-time warning. _health_degraded debounces
+        # the warning so we don't re-fire on every event while in the
+        # degraded state.
+        self._health_events: list[float] = []
+        self._health_degraded = False
+        self.HEALTH_WINDOW_S = 60.0
+        self.HEALTH_DEGRADED_THRESHOLD = 2
 
     def _set_state(self, state: str) -> None:
         try:
@@ -409,6 +374,100 @@ class AraAgent:
             self._event_callback(kind, text)
         except Exception:
             pass
+
+    def _record_xai_failure(self, kind: str) -> None:
+        """Note a watchdog stall or server error against the health
+        window. If we cross the degraded threshold, surface a clear
+        one-time warning so the user knows it's not just bad luck on
+        this turn — the service itself is unhappy."""
+        now = time.time()
+        cutoff = now - self.HEALTH_WINDOW_S
+        self._health_events = [t for t in self._health_events if t >= cutoff]
+        self._health_events.append(now)
+        if (not self._health_degraded
+                and len(self._health_events) >= self.HEALTH_DEGRADED_THRESHOLD):
+            self._health_degraded = True
+            msg = (
+                f"xAI voice service appears degraded — "
+                f"{len(self._health_events)} failures in the last "
+                f"{int(self.HEALTH_WINDOW_S)}s ({kind} most recent). "
+                f"Audio may be unreliable; consider pausing for a minute."
+            )
+            log.warning("health: %s", msg)
+            self._emit_event("warn", f"⚠ {msg}")
+            # Stdout too — user may have HUD hidden but always sees terminal.
+            print(f"⚠️  {msg}")
+
+    def _record_xai_success(self) -> None:
+        """A clean response with audio landed. If we'd been degraded
+        and the failure window is now empty, declare recovery — gives
+        the user a clear signal that things are working again."""
+        if not self._health_degraded:
+            return
+        now = time.time()
+        cutoff = now - self.HEALTH_WINDOW_S
+        self._health_events = [t for t in self._health_events if t >= cutoff]
+        if not self._health_events:
+            self._health_degraded = False
+            log.info("health: xAI service recovered (window cleared)")
+            self._emit_event("info", "✓ xAI service looks healthy again.")
+            print("✓ xAI service looks healthy again.")
+
+    def report_turn_start(self, label: str = "Turn") -> None:
+        """Notify the cost system that we are starting a turn that is expected
+        to consume tokens (vision packet, tool follow-up, etc.). This allows
+        the dedicated cost panel to show 'in-flight' activity.
+        """
+        if self._cost_callback:
+            try:
+                self._cost_callback({"type": "turn_start", "label": label})
+            except Exception:
+                log.exception("cost_callback (turn_start) failed")
+
+    def _accumulate_usage(self, usage: dict) -> None:
+        """Record token usage reported by the xAI Realtime server for one response.
+        This is the ground-truth data for what this session consumed.
+        We accumulate across all responses for the lifetime of the connection.
+        """
+        if not usage:
+            return
+
+        input_t = usage.get("input_tokens", 0) or usage.get("input_tokens_details", {}).get("text_tokens", 0) or 0
+        output_t = usage.get("output_tokens", 0) or usage.get("output_tokens_details", {}).get("text_tokens", 0) or 0
+
+        # Some voice endpoints report separate audio tokens
+        audio_input = usage.get("input_tokens_details", {}).get("audio_tokens", 0) or 0
+        audio_output = usage.get("output_tokens_details", {}).get("audio_tokens", 0) or 0
+
+        total = usage.get("total_tokens", input_t + output_t) or 0
+
+        self._session_input_tokens += input_t + audio_input
+        self._session_output_tokens += output_t + audio_output
+        self._session_total_tokens += total
+        self._last_usage = usage
+
+        log.info(
+            "usage: +%d in / +%d out (total session: %d in, %d out, %d total)",
+            input_t + audio_input,
+            output_t + audio_output,
+            self._session_input_tokens,
+            self._session_output_tokens,
+            self._session_total_tokens,
+        )
+
+        # Feed the raw usage dict to the dedicated CostHUD (if wired)
+        if self._cost_callback:
+            try:
+                self._cost_callback({"type": "usage", "usage": usage})
+            except Exception:
+                log.exception("cost_callback failed")
+
+        # Also emit the old string event for anything still listening
+        cost_text = (
+            f"Session: {self._session_input_tokens} in / {self._session_output_tokens} out "
+            f"({self._session_total_tokens} total tokens)"
+        )
+        self._emit_event("cost", cost_text)
 
     async def stop(self) -> None:
         """Cleanly shut down: stop loops and close the WS so run() returns."""
@@ -499,16 +558,23 @@ class AraAgent:
             await asyncio.sleep(self.STALL_THRESHOLD_S)
         except asyncio.CancelledError:
             return  # Progress arrived in time — exactly what we want.
+        last_progress = getattr(self, '_last_progress_ts', None)
+        time_since = (time.time() - last_progress) if last_progress else None
+
         log.warning(
-            "stall watchdog: no audio/transcript progress in %.1fs — "
-            "inferring server-side hang, cancelling response",
+            "stall watchdog fired | run_id=%s | threshold=%.1fs | time_since_last_progress=%.1fs | "
+            "last_event_context=%s",
+            self._run_id,
             self.STALL_THRESHOLD_S,
+            time_since or -1,
+            "recent_vision" if getattr(self, '_recent_vision_packet', False) else "normal",
         )
         self._emit_event(
             "warn",
             f"Model stalled ({self.STALL_THRESHOLD_S:.0f}s no audio). "
             "Server may be degraded — cancelling.",
         )
+        self._record_xai_failure("stall watchdog")
         try:
             if self.ws is not None:
                 await self.ws.send(json.dumps({"type": "response.cancel"}))
@@ -531,55 +597,56 @@ class AraAgent:
             self._is_streaming = False
         self._response_active = False
         self._set_state("listening")
-        # If this stall was on a capture turn and we have retries left,
-        # quietly resend response.create. Most of the xAI flakiness on
-        # text-injection turns is transient — a retry usually lands.
-        if self._pending_capture_retry is not None:
-            asyncio.create_task(self._auto_retry_capture_turn())
+        # If this stall was on a turn we care about retrying (capture-
+        # induced or tool follow-up), quietly resend response.create.
+        # Most xAI flakiness on text-injection turns is transient.
+        if self._pending_response_retry is not None:
+            asyncio.create_task(self._auto_retry_response_turn())
 
-    async def _auto_retry_capture_turn(self) -> None:
-        """Resend response.create on a capture turn that the watchdog
-        just cancelled, up to MAX_CAPTURE_RETRIES additional times.
+    async def _auto_retry_response_turn(self) -> None:
+        """Resend response.create on a programmatic turn (capture or
+        tool follow-up) that the watchdog just cancelled, up to
+        MAX_RESPONSE_RETRIES additional times.
 
-        We don't re-send the conversation.item.create — the server
-        already has the user message in its conversation history. Just
-        ask for a fresh response on the existing turn.
+        We don't re-send any conversation.item.create — the server
+        already has the user message / function_call_output in its
+        history. Just ask for a fresh response on the existing turn.
 
         Brief backoff first so the server has time to fully tear down
         the cancelled response on its side. Aborts if a real new
         response started in the interim (e.g., user spoke), so user
         input always wins over our retry."""
-        pending = self._pending_capture_retry
+        pending = self._pending_response_retry
         if pending is None:
             return
         if pending["attempts"] >= pending["max_attempts"]:
             log.warning(
-                "auto-retry: exhausted (%d/%d attempts on capture turn)",
+                "auto-retry: exhausted (%d/%d attempts)",
                 pending["attempts"], pending["max_attempts"],
             )
             self._emit_event(
                 "warn",
-                f"Capture failed after {pending['attempts']} attempts. "
+                f"Response failed after {pending['attempts']} attempts. "
                 "xAI's voice backend looks unhealthy right now — try again "
                 "in a moment.",
             )
-            self._pending_capture_retry = None
+            self._pending_response_retry = None
             return
         await asyncio.sleep(1.0)
         # Conditions may have changed while we slept.
-        if self._pending_capture_retry is None:
+        if self._pending_response_retry is None:
             return  # Cleared by success or explicit error
         if self._response_active:
             log.info("auto-retry: skipping, a new response is already active")
             return
         pending["attempts"] += 1
         log.warning(
-            "auto-retry capture turn (attempt %d/%d)",
+            "auto-retry response (attempt %d/%d)",
             pending["attempts"], pending["max_attempts"],
         )
         self._emit_event(
             "info",
-            f"Retrying capture (attempt {pending['attempts']}/"
+            f"Retrying response (attempt {pending['attempts']}/"
             f"{pending['max_attempts']})…",
         )
         # Allow the next response.created/output_item.added through.
@@ -590,7 +657,7 @@ class AraAgent:
                 await self.ws.send(json.dumps({"type": "response.create"}))
         except Exception:
             log.exception("auto-retry: response.create send failed")
-            self._pending_capture_retry = None
+            self._pending_response_retry = None
 
     async def cancel_response(self) -> None:
         """Barge-in: cancel the in-flight server response. Clears the
@@ -661,7 +728,10 @@ class AraAgent:
         the watchdog can quietly resend response.create up to N times
         before giving up."""
         from ara_agent.context import build_capture_packet
-        from ara_agent.screenshot import capture_and_describe
+        from ara_agent.screenshot import (
+            ScreenCaptureBusyError,
+            capture_and_describe,
+        )
 
         if self.ws is None:
             return
@@ -670,11 +740,27 @@ class AraAgent:
         triggered_response = False
         try:
             self._emit_event("info", "Describing image…")
-            result = await capture_and_describe(XAI_API_KEY)
+            self.report_turn_start("Vision description")
+            try:
+                result = await capture_and_describe(XAI_API_KEY)
+            except ScreenCaptureBusyError:
+                # macOS rejected our `screencapture -i` because another
+                # interactive capture is already running system-wide.
+                # Usually leftover state from a previous agent process.
+                log.warning(
+                    "capture aborted: another interactive screencapture "
+                    "is already in progress"
+                )
+                self._emit_event(
+                    "warn",
+                    "Another screen capture is already in progress — "
+                    "dismiss it (ESC) and try again.",
+                )
+                return
             if result is None:
                 self._emit_event("info", "Capture cancelled")
                 return
-            description, screenshot_path = result
+            description, screenshot_path, vision_usage = result if len(result) == 3 else (*result, {})
             # Replace any previous cached screenshot with this fresh one
             # so read_screen_region_text reuses what the user just selected.
             self._clear_last_capture()
@@ -682,18 +768,66 @@ class AraAgent:
             self._emit_event(
                 "info", f"Image  {description[:120]}",
             )
+
+            # Feed the actual usage from the vision description call (this is real spend)
+            if vision_usage:
+                if self._cost_callback:
+                    self._cost_callback({"type": "usage", "usage": vision_usage})
+
+            # === Hybrid model path (preferred for complex work) ===
+            brain = self.brain
+            if brain is None:
+                # Create a lightweight Brain on the fly for this screenshot.
+                # In a fuller implementation the OverlayController would own a persistent Brain.
+                try:
+                    brain = Brain(
+                        api_key=XAI_API_KEY,
+                        tools=TOOLS,
+                        system_prompt=(
+                            "You are Ara, a warm and competent macOS sysadmin. "
+                            "The user just showed you a screenshot. Respond naturally "
+                            "and helpfully about what you see. Be concise."
+                        ),
+                    )
+                except Exception:
+                    brain = None
+
+            if brain is not None:
+                log.info("[hybrid] Using Brain for screenshot response (run_id=%s)", self._run_id)
+                context = build_capture_packet("vision", description)
+                spoken = brain.respond_to_screenshot(
+                    description=description,
+                    app_context=context,
+                )
+                log.info("[hybrid] Brain produced response (%d chars)", len(spoken) if spoken else 0)
+                # Speak via the Realtime connection
+                if self.ws is not None:
+                    await self.ws.send(json.dumps({
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": spoken}]
+                        }
+                    }))
+                    await self.ws.send(json.dumps({"type": "response.create"}))
+                return   # Skip the old injection path when we have a Brain
+
+            # === Legacy / pure Realtime path (being phased out for complex flows) ===
             # Same chokepoint — probes app/window so the description
             # doesn't float context-free.
             framed = build_capture_packet("vision", description)
             await self._yield_to_new_turn("vision")
             log.info("sending vision packet to model: %d chars", len(framed))
+            self.report_turn_start("Vision injection")
+            self._recent_vision_packet = True
             await self._send_capture_turn(framed)
             log.info("vision packet sent, awaiting response")
             # Arm auto-retry. The watchdog will resend response.create
             # if the server stalls before producing audio.
-            self._pending_capture_retry = {
+            self._pending_response_retry = {
                 "attempts": 1,
-                "max_attempts": self.MAX_CAPTURE_RETRIES + 1,
+                "max_attempts": self.MAX_RESPONSE_RETRIES + 1,
             }
             triggered_response = True
         except Exception as e:
@@ -718,6 +852,7 @@ class AraAgent:
             }
         }))
 
+        log.info("connected to Realtime | run_id=%s", self._run_id)
         print("✅ Connected to Ara (xAI Voice Agent)")
         self._set_state("listening")
 
@@ -864,6 +999,7 @@ class AraAgent:
                         if self._underrun_frames > 0:
                             ms = self._underrun_frames * 1000 / SAMPLE_RATE
                             print(f"⏱️  buffer-starvation this response: {ms:.0f} ms total")
+                            log.info("buffer_starvation: %.0f ms (run_id=%s)", ms, self._run_id)
                         self._underrun_frames = 0
                         self._set_state("listening")
                         currently_playing = False
@@ -902,6 +1038,7 @@ class AraAgent:
                 )
                 log.error("server error event: %s", err)
                 self._emit_event("warn", f"Server error: {err_msg}")
+                self._record_xai_failure("server error")
                 self._clear_stall_watchdog()
                 # Server has admitted the response failed — ignore anything
                 # else it dribbles out for the same turn.
@@ -911,25 +1048,25 @@ class AraAgent:
                 # territory (oversized input, rate limit, content rejection),
                 # not a transient stall. Retrying the same packet will hit
                 # the same wall. Drop pending retry so we don't loop.
-                if self._pending_capture_retry is not None:
+                if self._pending_response_retry is not None:
                     log.info(
-                        "clearing pending capture retry on server error "
+                        "clearing pending retry on server error "
                         "(retry would hit the same failure)"
                     )
-                    self._pending_capture_retry = None
+                    self._pending_response_retry = None
                 self._set_state("listening")
                 continue
 
             if msg_type == "input_audio_buffer.speech_started":
                 # User is talking → any pending auto-retry from a prior
-                # capture turn is no longer wanted. User input always
-                # wins over our retry attempts.
-                if self._pending_capture_retry is not None:
+                # programmatic turn is no longer wanted. User input
+                # always wins over our retry attempts.
+                if self._pending_response_retry is not None:
                     log.info(
                         "user started speaking — abandoning pending "
-                        "capture retry"
+                        "response retry"
                     )
-                    self._pending_capture_retry = None
+                    self._pending_response_retry = None
                 continue
 
             if msg_type == "response.created":
@@ -940,6 +1077,18 @@ class AraAgent:
                 # have to arrive before response.created of the next one),
                 # but the new response is processed normally.
                 self._abandoned_response = False
+                # Arm the stall watchdog NOW, not just at output_item.added.
+                # When xAI's backend is degraded it sometimes acknowledges
+                # response.create with response.created but never commits
+                # to producing an output_item — we saw a retry get stuck
+                # in exactly that pre-content limbo for 77 seconds before
+                # the server's own idle-timeout fired. Healthy traffic
+                # gets from response.created to output_item.added in
+                # under 2s; the 5s watchdog gives plenty of headroom.
+                # output_item.added / audio.delta / transcript.delta all
+                # re-bump the watchdog, so this just catches the gap
+                # before the first content event.
+                self._bump_progress()
                 # Reset per-response telemetry. start = when server signaled
                 # response begins; first_audio fills in when first chunk arrives.
                 self._resp_stats = {
@@ -988,17 +1137,21 @@ class AraAgent:
                     self._response_active = True
                     # Real audio is the strongest progress signal.
                     self._bump_progress()
-                    # Audio arrived → the capture turn (if there was one
-                    # pending retry) succeeded. Clear the retry state so
-                    # we don't accidentally fire another retry if a later
-                    # mid-stream stall happens.
-                    if self._pending_capture_retry is not None:
+                    # Audio arrived → the programmatic turn (if there
+                    # was one with a pending retry) succeeded. Clear the
+                    # retry state so we don't accidentally fire another
+                    # retry if a later mid-stream stall happens.
+                    if self._pending_response_retry is not None:
                         log.info(
-                            "capture turn produced audio after %d attempt(s)"
+                            "response produced audio after %d attempt(s)"
                             " — clearing retry state",
-                            self._pending_capture_retry["attempts"],
+                            self._pending_response_retry["attempts"],
                         )
-                        self._pending_capture_retry = None
+                        self._pending_response_retry = None
+                    # Audio = service is alive. If we'd previously been
+                    # in the degraded state and the window has emptied,
+                    # this is recovery.
+                    self._record_xai_success()
 
                     # Telemetry: time of first chunk, inter-chunk gaps.
                     now = loop.time()
@@ -1008,6 +1161,7 @@ class AraAgent:
                             stats["first_audio"] = now
                             ttfb_ms = (now - stats["start"]) * 1000
                             print(f"📊 First audio after {ttfb_ms:.0f}ms")
+                            log.info("first_audio: %dms (run_id=%s)", int(ttfb_ms), self._run_id)
                         elif stats["last_chunk"] is not None:
                             gap_ms = (now - stats["last_chunk"]) * 1000
                             if gap_ms > stats["max_gap_ms"]:
@@ -1074,6 +1228,7 @@ class AraAgent:
                     # to make the model speak about what the tool
                     # returned. Without this, Ara goes silent after the
                     # command runs.
+                    self.report_turn_start(f"Tool follow-up ({tool_name})")
                     await self.ws.send(json.dumps({
                         "type": "response.create",
                     }))
@@ -1085,6 +1240,15 @@ class AraAgent:
                     # transition to "listening" before the follow-up's
                     # first audio chunk lands.
                     self._response_active = True
+                    # Arm auto-retry for this tool-follow-up turn too.
+                    # xAI's text-input pipeline stalls on tool follow-ups
+                    # the same way it stalls on capture turns (saw a 30s
+                    # idle-timeout on the post-read response in the
+                    # field). Cleared on first audio = success.
+                    self._pending_response_retry = {
+                        "attempts": 1,
+                        "max_attempts": self.MAX_RESPONSE_RETRIES + 1,
+                    }
                 finally:
                     # Always clear the tool-flow flag so response.done for
                     # the follow-up actually transitions us to listening.
@@ -1119,12 +1283,35 @@ class AraAgent:
                         f"max gap {stats['max_gap_ms']:.0f}ms, "
                         f"{stats['gaps_over_500ms']} gaps>500ms{tool_tag}"
                     )
+                    log.info(
+                        "response_stats: wall=%.0fms audio=%.0fms deficit=%+.0fms chunks=%d "
+                        "max_gap=%.0fms gaps>500ms=%d%s (run_id=%s)",
+                        wall_ms, audio_ms, deficit_ms, stats['count'],
+                        stats['max_gap_ms'], stats['gaps_over_500ms'], tool_tag, self._run_id
+                    )
+
+                # Capture any usage the server attached to this response (the ground truth)
+                resp = data.get("response", {})
+                if isinstance(resp, dict) and resp.get("usage"):
+                    self._accumulate_usage(resp["usage"])
+
+                self._recent_vision_packet = False  # reset after a response completes
 
             else:
                 # Unknown / unhandled event type. Log at DEBUG so we don't
                 # spam the file with every audio-delta variant, but enough
                 # that we can spot new server events when something breaks.
                 log.debug("unhandled message type: %s", msg_type)
+
+                # Temporary discovery logging for cost tracking work.
+                # If the Realtime server ever sends usage info, we want to see
+                # the exact shape so we can accumulate ground-truth tokens.
+                if "usage" in data:
+                    log.info("USAGE EVENT RECEIVED: %s", data.get("usage"))
+                    self._accumulate_usage(data["usage"])
+                elif isinstance(data.get("response"), dict) and "usage" in data["response"]:
+                    log.info("USAGE IN RESPONSE: %s", data["response"]["usage"])
+                    self._accumulate_usage(data["response"]["usage"])
 
     async def execute_tool(self, name: str, args: dict) -> str:
         """Dispatch to a tool implementation. Sync tools run in the
@@ -1144,6 +1331,7 @@ class AraAgent:
         if name == "read_screen_region_text":
             from ara_agent.screenshot import (
                 NO_PROSE_SENTINEL,
+                ScreenCaptureBusyError,
                 capture_and_clean_for_reading,
             )
             # Prefer the screenshot from the user's most recent Capture
@@ -1168,9 +1356,29 @@ class AraAgent:
                 self._emit_event(
                     "info", "Select the text you want me to read…",
                 )
-            result = await capture_and_clean_for_reading(
-                XAI_API_KEY, existing_path=cached,
-            )
+            try:
+                result = await capture_and_clean_for_reading(
+                    XAI_API_KEY, existing_path=cached,
+                )
+            except ScreenCaptureBusyError:
+                # Gives the model concrete language so it can tell the
+                # user exactly why we couldn't read the screen — not
+                # the generic "capture failed" mumble.
+                log.warning(
+                    "read_screen_region_text: another screencapture "
+                    "is already in progress"
+                )
+                self._emit_event(
+                    "warn",
+                    "Another screen capture is already in progress.",
+                )
+                return (
+                    "I tried to capture the screen but another interactive "
+                    "screen capture is already in progress on this Mac. "
+                    "Ask the user to complete or cancel the open capture "
+                    "(it's usually a system selection prompt waiting for "
+                    "them), then ask me to try again."
+                )
             if result is None:
                 return (
                     "Capture was cancelled, no text was found on the "

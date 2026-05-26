@@ -77,6 +77,7 @@ After those land:
 - `src/ara_agent/overlay.py` — Floating overlay, menu, hotkey wiring
 - `src/ara_agent/output_hud.py` — Structured event log (next target for the HUD UX work)
 - `CLAUDE.md` — How to work with Claude on this project
+- `docs/adr/` — Architecture Decision Records (important design choices and their rationale)
 
 ## Philosophy & Constraints
 

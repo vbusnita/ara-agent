@@ -35,7 +35,19 @@ import urllib.request
 from pathlib import Path
 from typing import Optional, Tuple
 
+import logging
+
 from PIL import Image
+
+log = logging.getLogger(__name__)
+
+
+class ScreenCaptureBusyError(Exception):
+    """Raised by capture_screen when macOS refuses to start an
+    interactive screencapture because another one is already in
+    progress (system-wide). Lets callers distinguish "another capture
+    is open right now" — which usually means stale state from a
+    previous agent process — from a normal user cancel."""
 
 try:
     LANCZOS = Image.Resampling.LANCZOS
@@ -60,13 +72,27 @@ def capture_screen() -> Optional[Path]:
         f"ara-screenshot-{os.getpid()}-{int(time.time() * 1000)}.png"
     )
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["screencapture", "-i", "-x", str(out)],
             check=False,
             timeout=120,
+            capture_output=True,
+            text=True,
         )
     except subprocess.TimeoutExpired:
         return None
+    # macOS allows only one interactive screencapture system-wide. If
+    # one is already running (commonly: orphaned from a previous
+    # agent process that was killed mid-capture), `screencapture -i`
+    # exits non-zero immediately with this message on stderr. Surface
+    # it as a typed exception so the caller can show the user a clear
+    # message instead of a generic "capture failed."
+    stderr = (r.stderr or "").strip()
+    if r.returncode != 0:
+        if "two interactive screen captures" in stderr.lower():
+            raise ScreenCaptureBusyError(stderr)
+        if stderr:
+            log.warning("screencapture nonzero exit: %s", stderr)
     if not out.exists() or out.stat().st_size == 0:
         return None
     return out
@@ -194,7 +220,8 @@ def describe_image_sync(path: Path, api_key: str) -> str:
     text = _extract_text(data)
     if not text:
         raise RuntimeError(f"Empty vision response: {data}")
-    return text
+    usage = data.get("usage", {})
+    return text, usage  # return both description and the usage the server reported
 
 
 async def capture_and_describe(
@@ -213,9 +240,13 @@ async def capture_and_describe(
     if path is None:
         return None
     try:
-        description = await loop.run_in_executor(
+        result = await loop.run_in_executor(
             None, describe_image_sync, path, api_key
         )
+        if isinstance(result, tuple):
+            description, vision_usage = result
+        else:
+            description, vision_usage = result, {}
     except urllib.error.HTTPError as e:
         body = ""
         try:
@@ -224,7 +255,6 @@ async def capture_and_describe(
             pass
         print(f"⚠️  Vision API error: {e.code} {e.reason}"
               + (f" — {body}" if body else ""))
-        # Failure → caller won't get a path to cache, so clean up here.
         try:
             path.unlink(missing_ok=True)
         except Exception:
@@ -237,7 +267,7 @@ async def capture_and_describe(
         except Exception:
             pass
         return None
-    return description, path
+    return description, path, vision_usage  # now also returns the usage from the vision call
 
 
 # ----- read-aloud mode: Apple OCR + grok-4.3 prose cleaning -----

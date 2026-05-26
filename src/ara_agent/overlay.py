@@ -18,7 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import subprocess
 import threading
+from pathlib import Path
 from typing import Dict, List, Optional
 
 log = logging.getLogger(__name__)
@@ -46,6 +49,8 @@ from PyObjCTools import AppHelper
 
 from ara_agent.hotkeys import GlobalHotkey
 from ara_agent.icons import ensure_icons
+from ara_agent.brain import Brain
+from ara_agent.cost_hud import CostHUD
 from ara_agent.output_hud import OutputHUD
 from ara_agent.rotary_hud import RotaryHUD
 from ara_agent.voice_agent import AraAgent
@@ -222,6 +227,10 @@ class OverlayController(NSObject):
         saved = defaults.objectForKey_("ara.hudVisible")
         self._hud_visible = bool(saved) if saved is not None else False
 
+        # Dedicated cost panel (separate floating window)
+        self._cost_hud = CostHUD.alloc().init()
+        self._cost_visible = False
+
         # If the user left the Inspection HUD visible on the previous run,
         # bring it back shortly after launch (after screens + windows are stable).
         # This makes "I placed my tools where I want them" actually stick on
@@ -265,6 +274,11 @@ class OverlayController(NSObject):
     def _on_agent_event(self, kind, text):
         if self._output_hud is not None:
             self._output_hud.log_event(kind, text)
+
+    def _on_cost_update(self, msg: dict):
+        """Forward cost-related messages (usage or turn_start) from the voice agent."""
+        if self._cost_hud is not None:
+            self._cost_hud.handle_cost_message(msg)
 
     # ---- hotkey ----
 
@@ -343,6 +357,14 @@ class OverlayController(NSObject):
         hud_item.setTarget_(self)
         menu.addItem_(hud_item)
 
+        # Cost panel toggle
+        cost_title = "Hide Cost Panel" if self._cost_visible else "Show Cost Panel"
+        cost_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            cost_title, "toggleCostPanel:", ""
+        )
+        cost_item.setTarget_(self)
+        menu.addItem_(cost_item)
+
         menu.addItem_(NSMenuItem.separatorItem())
 
         quit_it = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -363,6 +385,13 @@ class OverlayController(NSObject):
         # menu — default is hidden, the blackhole overlay is enough.
         if self._hud_visible and self._output_hud is not None:
             self._output_hud.show()
+
+        # Reset session cost on every new listening session
+        if self._cost_hud is not None:
+            self._cost_hud.new_session()
+            if self._cost_visible:
+                self._cost_hud.show()
+
         self._agent_thread = threading.Thread(
             target=self._run_agent, daemon=True
         )
@@ -380,6 +409,15 @@ class OverlayController(NSObject):
             self._output_hud.show()
         else:
             self._output_hud.hide()
+
+    def toggleCostPanel_(self, _sender):
+        if self._cost_hud is None:
+            return
+        self._cost_visible = not self._cost_visible
+        if self._cost_visible:
+            self._cost_hud.show()
+        else:
+            self._cost_hud.hide()
 
     def showPersistedHUD_(self, _timer):
         """Called via delayed NSTimer on launch when the user had left the
@@ -429,17 +467,40 @@ class OverlayController(NSObject):
             self._hotkey = None
         if self._rotary is not None:
             self._rotary.hide()
+        if self._cost_hud is not None:
+            self._cost_hud.hide()
         NSApp.terminate_(None)
 
     # ---- agent lifecycle (background thread) ----
 
     def _run_agent(self):
-        log.info("agent thread starting")
+        import uuid
+        import subprocess
+        self._run_id = str(uuid.uuid4())[:8]
+
+        # Rich session header so logs are self-describing
+        try:
+            git_sha = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=Path(__file__).parent.parent.parent,
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except Exception:
+            git_sha = "unknown"
+
+        log.info(
+            "=== SESSION START === run_id=%s | git=%s | pid=%d",
+            self._run_id, git_sha, os.getpid()
+        )
+        print(f"🔬 Run ID: {self._run_id}  (logs are now self-contained for this run)")
+
         self._agent_loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._agent_loop)
         self._agent = AraAgent(
             state_callback=self._on_agent_state,
             event_callback=self._on_agent_event,
+            cost_callback=self._on_cost_update,
+            run_id=self._run_id,
         )
         try:
             self._agent_loop.run_until_complete(self._agent.run())

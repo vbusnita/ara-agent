@@ -59,6 +59,8 @@ We're currently focused on the overlay experience as the main way to use Ara.
 
 If you are an AI agent working in this codebase, also read **CLAUDE.md** — it contains the operating manual and collaboration guidelines used on this project.
 
+Important architectural decisions are recorded in [docs/adr/](docs/adr/).
+
 ## Philosophy
 
 - The agent should feel like a calm, competent presence on your Mac — not another chat window.
